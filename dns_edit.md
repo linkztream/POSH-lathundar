@@ -22,7 +22,7 @@ Slår upp `contoso.local` med datorns konfigurerade DNS-server.
 Resolve-DnsName contoso.local -Server 10.0.16.2
 ```
 
-Slår upp `www.poe-vault.com` hos DNS-servern `10.0.16.2`.
+Slår upp `contoso.local` hos DNS-servern `10.0.16.2`.
 
 ---
 
