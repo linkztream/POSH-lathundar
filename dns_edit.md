@@ -1,42 +1,42 @@
-# Windows AD-integrerad DNS – PowerShell Lathund
+# Windows AD-integrerad DNS – PowerShell-lathund
 
 En praktisk lathund för administration och felsökning av Microsoft DNS Server med PowerShell.
 
----
-
-# Slå upp DNS-poster
-
-## Standarduppslag
+> De flesta serverkommandon kräver modulen `DnsServer`, som finns på en DNS-server eller installeras via RSAT.
 
 ```powershell
-Resolve-DnsName contoso.local
+Import-Module DnsServer
 ```
-
-Slår upp `contoso.local` med datorns konfigurerade DNS-server.
 
 ---
 
-## Ange specifik DNS-server
+## Slå upp DNS-poster
+
+### Standarduppslag
 
 ```powershell
-Resolve-DnsName contoso.local -Server 10.0.16.2
+Resolve-DnsName www.poe-vault.com
 ```
 
-Slår upp `contoso.local` hos DNS-servern `10.0.16.2`.
+Slår upp `www.poe-vault.com` med datorns konfigurerade DNS-server.
 
----
+### Ange specifik DNS-server
 
-## A-post
+```powershell
+Resolve-DnsName www.poe-vault.com -Server 10.0.16.2
+```
+
+Slår upp `www.poe-vault.com` hos DNS-servern `10.0.16.2`.
+
+### A-post
 
 ```powershell
 Resolve-DnsName dc01.contoso.local -Type A
 ```
 
-Visar endast A-poster.
+Visar endast IPv4-adresser.
 
----
-
-## AAAA-post
+### AAAA-post
 
 ```powershell
 Resolve-DnsName dc01.contoso.local -Type AAAA
@@ -44,19 +44,15 @@ Resolve-DnsName dc01.contoso.local -Type AAAA
 
 Visar endast IPv6-adresser.
 
----
-
-## MX-poster
+### MX-poster
 
 ```powershell
 Resolve-DnsName contoso.local -Type MX
 ```
 
-Visar domänens mailservrar.
+Visar domänens e-postservrar.
 
----
-
-## NS-poster
+### NS-poster
 
 ```powershell
 Resolve-DnsName contoso.local -Type NS
@@ -64,73 +60,65 @@ Resolve-DnsName contoso.local -Type NS
 
 Visar domänens namnservrar.
 
----
-
-## SRV-poster (Domain Controllers)
+### SRV-poster för Domain Controllers
 
 ```powershell
 Resolve-DnsName _ldap._tcp.dc._msdcs.contoso.local -Type SRV
 ```
 
-Visar vilka Domain Controllers som annonserar LDAP.
+Visar vilka Domain Controllers som annonserar LDAP-tjänsten.
 
----
-
-## PTR (Reverse Lookup)
+### PTR – reverse lookup
 
 ```powershell
 Resolve-DnsName 10.0.16.25 -Type PTR
 ```
 
-Slår upp reverse DNS.
+Slår upp motsvarande PTR-post.
 
 ---
 
-# Hantera DNS-zoner
+## Hantera DNS-zoner
 
-## Lista alla zoner
+### Lista alla zoner
 
 ```powershell
 Get-DnsServerZone
 ```
 
----
-
-## Lista zoner på annan server
+### Lista zoner på en annan DNS-server
 
 ```powershell
 Get-DnsServerZone -ComputerName DC01
 ```
 
----
-
-## Visa replikeringsscope
+### Visa replikeringsscope
 
 ```powershell
-Get-DnsServerZone contoso.local |
-Select ZoneName,ReplicationScope
+Get-DnsServerZone -Name contoso.local |
+    Select-Object ZoneName, ReplicationScope
 ```
 
-Exempel på replikeringsscope:
+Vanliga replikeringsscope:
 
-- Forest
-- Domain
-- Legacy
-- Custom
+| Scope | Betydelse |
+|---|---|
+| `Forest` | Alla DNS-servrar i skogen |
+| `Domain` | Alla DNS-servrar i domänen |
+| `Legacy` | Äldre domänomfattande replikering |
+| `Custom` | Egen application directory partition |
 
 ---
 
-# Visa DNS-poster
+## Visa DNS-poster
 
-## Alla poster
+### Alla poster i en zon
 
 ```powershell
 Get-DnsServerResourceRecord -ZoneName contoso.local
 ```
 
----
-
-## Endast A-poster
+### Endast A-poster
 
 ```powershell
 Get-DnsServerResourceRecord `
@@ -138,9 +126,7 @@ Get-DnsServerResourceRecord `
     -RRType A
 ```
 
----
-
-## Endast PTR-poster
+### Endast PTR-poster
 
 ```powershell
 Get-DnsServerResourceRecord `
@@ -148,9 +134,7 @@ Get-DnsServerResourceRecord `
     -RRType PTR
 ```
 
----
-
-## Visa en specifik post
+### En specifik post
 
 ```powershell
 Get-DnsServerResourceRecord `
@@ -158,11 +142,20 @@ Get-DnsServerResourceRecord `
     -Name server01
 ```
 
+### Från en annan DNS-server
+
+```powershell
+Get-DnsServerResourceRecord `
+    -ComputerName DC01 `
+    -ZoneName contoso.local `
+    -Name server01
+```
+
 ---
 
-# Skapa poster
+## Skapa DNS-poster
 
-## Skapa A-post
+### Skapa A-post
 
 ```powershell
 Add-DnsServerResourceRecordA `
@@ -171,9 +164,7 @@ Add-DnsServerResourceRecordA `
     -IPv4Address 10.0.16.100
 ```
 
----
-
-## Skapa A-post + PTR
+### Skapa A-post och tillhörande PTR-post
 
 ```powershell
 Add-DnsServerResourceRecordA `
@@ -183,11 +174,9 @@ Add-DnsServerResourceRecordA `
     -CreatePtr
 ```
 
-Skapar både A- och PTR-post.
+Motsvarar GUI-valet **Create associated pointer (PTR) record**.
 
----
-
-## Skapa PTR
+### Skapa PTR-post manuellt
 
 ```powershell
 Add-DnsServerResourceRecordPtr `
@@ -196,9 +185,7 @@ Add-DnsServerResourceRecordPtr `
     -PtrDomainName server01.contoso.local
 ```
 
----
-
-## Skapa CNAME
+### Skapa CNAME
 
 ```powershell
 Add-DnsServerResourceRecordCName `
@@ -209,56 +196,50 @@ Add-DnsServerResourceRecordCName `
 
 ---
 
-# Ändra poster
+## Ändra DNS-poster
 
-## Ändra IP-adress
+### Ändra IP-adress
 
 ```powershell
-$old = Get-DnsServerResourceRecord `
+$oldRecord = Get-DnsServerResourceRecord `
     -ZoneName contoso.local `
-    -Name server01
+    -Name server01 `
+    -RRType A
 
-$new = $old.Clone()
-$new.RecordData.IPv4Address = [IPAddress]"10.0.16.150"
+$newRecord = $oldRecord.Clone()
+$newRecord.RecordData.IPv4Address = [IPAddress]'10.0.16.150'
 
 Set-DnsServerResourceRecord `
     -ZoneName contoso.local `
-    -OldInputObject $old `
-    -NewInputObject $new
+    -OldInputObject $oldRecord `
+    -NewInputObject $newRecord
 ```
 
----
-
-## Ändra IP-adress och uppdatera PTR
-
-(Motsvarar GUI-valet **Update associated pointer (PTR) record**.)
+### Ändra IP-adress och skapa eller uppdatera PTR
 
 ```powershell
-$old = Get-DnsServerResourceRecord `
+$oldRecord = Get-DnsServerResourceRecord `
     -ZoneName contoso.local `
-    -Name server01
+    -Name server01 `
+    -RRType A
 
-$new = $old.Clone()
-$new.RecordData.IPv4Address = [IPAddress]"10.0.16.150"
+$newRecord = $oldRecord.Clone()
+$newRecord.RecordData.IPv4Address = [IPAddress]'10.0.16.150'
 
 Set-DnsServerResourceRecord `
     -ZoneName contoso.local `
-    -OldInputObject $old `
-    -NewInputObject $new `
+    -OldInputObject $oldRecord `
+    -NewInputObject $newRecord `
     -CreatePtr
 ```
 
-> **OBS!**
->
-> Det finns inget kommando som enbart aktiverar "Update associated PTR record" på en befintlig post.
->
-> `-CreatePtr` används endast när posten skapas eller uppdateras.
+> `-CreatePtr` används när A-posten skapas eller uppdateras. Det är inte en permanent egenskap eller kryssruta som lagras på själva A-posten.
 
 ---
 
-# Ta bort poster
+## Ta bort DNS-poster
 
-## Ta bort A-post
+### Ta bort en A-post
 
 ```powershell
 Remove-DnsServerResourceRecord `
@@ -267,42 +248,284 @@ Remove-DnsServerResourceRecord `
     -RRType A
 ```
 
----
-
-## Ta bort PTR
+### Hämta och pipe:a till borttagning
 
 ```powershell
+Get-DnsServerResourceRecord `
+    -ZoneName contoso.local `
+    -Name server01 `
+    -RRType A |
 Remove-DnsServerResourceRecord `
-    -ZoneName 16.0.10.in-addr.arpa `
-    -Name 100 `
-    -RRType PTR
+    -ZoneName contoso.local
 ```
+
+### Utan extra bekräftelse från cmdleten
+
+```powershell
+Get-DnsServerResourceRecord `
+    -ZoneName contoso.local `
+    -Name server01 `
+    -RRType A |
+Remove-DnsServerResourceRecord `
+    -ZoneName contoso.local `
+    -Force
+```
+
+### Filtrera poster före borttagning
+
+```powershell
+Get-DnsServerResourceRecord `
+    -ZoneName contoso.local |
+Where-Object HostName -Like 'TEST*'
+```
+
+Kontrollera resultatet först. Lägg därefter till borttagningen:
+
+```powershell
+Get-DnsServerResourceRecord `
+    -ZoneName contoso.local |
+Where-Object HostName -Like 'TEST*' |
+Remove-DnsServerResourceRecord `
+    -ZoneName contoso.local `
+    -Force
+```
+
+> En vanlig DNS-administratör kör filtret först. En modig DNS-administratör kör allt direkt. En erfaren DNS-administratör har blivit den förstnämnda.
 
 ---
 
-# DNS-cache
+## Funktion: ta bort A-post och tillhörande PTR-post
 
-## Rensa DNS-cache
+`Remove-DnsServerResourceRecord` tar inte automatiskt bort PTR-posten när en A-post tas bort. Funktionen nedan:
+
+- hämtar en eller flera A-poster,
+- läser ut IPv4-adressen,
+- hittar den längsta matchande reverse-zonen på DNS-servern,
+- tar endast bort PTR-poster som pekar på samma FQDN,
+- tar därefter bort A-posten,
+- stöder `-WhatIf` och `-Confirm`,
+- kan arbeta mot en fjärransluten DNS-server.
+
+```powershell
+function Remove-DnsARecordWithPtr {
+    [CmdletBinding(
+        SupportsShouldProcess = $true,
+        ConfirmImpact = 'High'
+    )]
+    param (
+        [Parameter(
+            Mandatory,
+            Position = 0,
+            ValueFromPipelineByPropertyName
+        )]
+        [Alias('HostName')]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+
+        [Parameter(Mandatory, Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ZoneName,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$ComputerName = $env:COMPUTERNAME
+    )
+
+    begin {
+        Import-Module DnsServer -ErrorAction Stop
+
+        try {
+            $reverseZones = Get-DnsServerZone `
+                -ComputerName $ComputerName `
+                -ErrorAction Stop |
+            Where-Object {
+                $_.ZoneName -like '*.in-addr.arpa'
+            } |
+            Select-Object -ExpandProperty ZoneName
+        }
+        catch {
+            throw "Kunde inte läsa reverse-zoner från '$ComputerName': $($_.Exception.Message)"
+        }
+    }
+
+    process {
+        $normalizedZone = $ZoneName.TrimEnd('.')
+        $fqdn = "$Name.$normalizedZone".TrimEnd('.')
+
+        try {
+            $aRecords = @(
+                Get-DnsServerResourceRecord `
+                    -ComputerName $ComputerName `
+                    -ZoneName $normalizedZone `
+                    -Name $Name `
+                    -RRType A `
+                    -ErrorAction Stop
+            )
+        }
+        catch {
+            throw "Kunde inte läsa A-posten '$fqdn' från '$ComputerName': $($_.Exception.Message)"
+        }
+
+        if ($aRecords.Count -eq 0) {
+            Write-Warning "Ingen A-post hittades för '$fqdn'."
+            return
+        }
+
+        foreach ($aRecord in $aRecords) {
+            $ipAddress = $aRecord.RecordData.IPv4Address.IPAddressToString
+            $reverseFqdn = (
+                ($ipAddress -split '\.')[3..0] -join '.'
+            ) + '.in-addr.arpa'
+
+            $reverseZone = $reverseZones |
+                Where-Object {
+                    $reverseFqdn -ieq $_ -or
+                    $reverseFqdn.EndsWith(".$_", [StringComparison]::OrdinalIgnoreCase)
+                } |
+                Sort-Object Length -Descending |
+                Select-Object -First 1
+
+            if ($reverseZone) {
+                if ($reverseFqdn -ieq $reverseZone) {
+                    $ptrNodeName = '@'
+                }
+                else {
+                    $ptrNodeName = $reverseFqdn.Substring(
+                        0,
+                        $reverseFqdn.Length - $reverseZone.Length - 1
+                    )
+                }
+
+                try {
+                    $ptrRecords = @(
+                        Get-DnsServerResourceRecord `
+                            -ComputerName $ComputerName `
+                            -ZoneName $reverseZone `
+                            -Name $ptrNodeName `
+                            -RRType PTR `
+                            -ErrorAction SilentlyContinue |
+                        Where-Object {
+                            $_.RecordData.PtrDomainName.TrimEnd('.') -ieq $fqdn
+                        }
+                    )
+
+                    foreach ($ptrRecord in $ptrRecords) {
+                        $target = "$ipAddress -> $fqdn i zonen $reverseZone"
+
+                        if ($PSCmdlet.ShouldProcess($target, 'Ta bort PTR-post')) {
+                            $ptrRecord |
+                                Remove-DnsServerResourceRecord `
+                                    -ComputerName $ComputerName `
+                                    -ZoneName $reverseZone `
+                                    -Force `
+                                    -ErrorAction Stop
+                        }
+                    }
+
+                    if ($ptrRecords.Count -eq 0) {
+                        Write-Verbose "Ingen matchande PTR-post hittades för '$ipAddress'."
+                    }
+                }
+                catch {
+                    Write-Warning "PTR-posten för '$ipAddress' kunde inte tas bort: $($_.Exception.Message)"
+                }
+            }
+            else {
+                Write-Warning "Ingen reverse-zon på '$ComputerName' matchar IP-adressen '$ipAddress'."
+            }
+
+            $target = "$fqdn [$ipAddress] i zonen $normalizedZone"
+
+            if ($PSCmdlet.ShouldProcess($target, 'Ta bort A-post')) {
+                try {
+                    $aRecord |
+                        Remove-DnsServerResourceRecord `
+                            -ComputerName $ComputerName `
+                            -ZoneName $normalizedZone `
+                            -Force `
+                            -ErrorAction Stop
+                }
+                catch {
+                    throw "A-posten '$fqdn' med adressen '$ipAddress' kunde inte tas bort: $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+}
+```
+
+### Testkör utan att ändra något
+
+```powershell
+Remove-DnsARecordWithPtr `
+    -Name server01 `
+    -ZoneName contoso.local `
+    -ComputerName DC01 `
+    -WhatIf
+```
+
+### Ta bort A- och PTR-post
+
+```powershell
+Remove-DnsARecordWithPtr `
+    -Name server01 `
+    -ZoneName contoso.local `
+    -ComputerName DC01
+```
+
+Eftersom funktionen har `ConfirmImpact = 'High'` begär den normalt bekräftelse.
+
+### Ta bort utan bekräftelse
+
+```powershell
+Remove-DnsARecordWithPtr `
+    -Name server01 `
+    -ZoneName contoso.local `
+    -ComputerName DC01 `
+    -Confirm:$false
+```
+
+### Pipe:a en hämtad post
+
+Funktionen accepterar egenskapen `HostName` som alias för `Name`:
+
+```powershell
+Get-DnsServerResourceRecord `
+    -ComputerName DC01 `
+    -ZoneName contoso.local `
+    -Name server01 `
+    -RRType A |
+Remove-DnsARecordWithPtr `
+    -ZoneName contoso.local `
+    -ComputerName DC01 `
+    -WhatIf
+```
+
+> Funktionen hanterar vanliga reverse-zoner på oktettgränser, exempelvis `/8`, `/16` och `/24`. RFC 2317-delegerade klasslösa reverse-zoner kräver separat logik eftersom deras zonnamn och CNAME-upplägg kan variera.
+
+---
+
+## DNS-cache
+
+### Rensa klientens DNS-cache
 
 ```powershell
 Clear-DnsClientCache
 ```
 
-eller
+Alternativt:
 
 ```cmd
 ipconfig /flushdns
 ```
 
----
-
-## Registrera DNS igen
+### Registrera klientens DNS-poster igen
 
 ```powershell
 Register-DnsClient
 ```
 
-eller
+Alternativt:
 
 ```cmd
 ipconfig /registerdns
@@ -310,54 +533,46 @@ ipconfig /registerdns
 
 ---
 
-# DNS-servrar
+## Klientens DNS-servrar
 
-## Visa DNS-servrar
+### Visa konfigurerade DNS-servrar
 
 ```powershell
 Get-DnsClientServerAddress
 ```
 
----
-
-## Ändra DNS-servrar
+### Ändra DNS-servrar
 
 ```powershell
 Set-DnsClientServerAddress `
     -InterfaceAlias Ethernet `
-    -ServerAddresses 10.0.16.2,10.0.16.3
+    -ServerAddresses 10.0.16.2, 10.0.16.3
 ```
 
 ---
 
-# DNS Server-konfiguration
+## DNS-serverkonfiguration
 
-## Visa Forwarders
+### Visa forwarders
 
 ```powershell
 Get-DnsServerForwarder
 ```
 
----
-
-## Lägg till Forwarders
+### Lägg till forwarders
 
 ```powershell
 Add-DnsServerForwarder `
-    -IPAddress 1.1.1.1,8.8.8.8
+    -IPAddress 1.1.1.1, 8.8.8.8
 ```
 
----
-
-## Visa Scavenging
+### Visa scavenging-inställningar
 
 ```powershell
 Get-DnsServerScavenging
 ```
 
----
-
-## Kör Scavenging
+### Starta scavenging
 
 ```powershell
 Start-DnsServerScavenging
@@ -365,17 +580,17 @@ Start-DnsServerScavenging
 
 ---
 
-# Testa DNS
+## Testa DNS
 
-## Testa DNS-port
+### Testa TCP-port 53
 
 ```powershell
 Test-NetConnection dc01.contoso.local -Port 53
 ```
 
----
+> Normal DNS-trafik använder vanligtvis UDP 53. `Test-NetConnection` testar här enbart TCP-porten.
 
-## Testa namnuppslag
+### Testa namnuppslag via ping
 
 ```powershell
 Test-Connection dc01
@@ -383,64 +598,50 @@ Test-Connection dc01
 
 ---
 
-# Active Directory
+## Active Directory
 
-## Lista Domain Controllers
+### Lista Domain Controllers
 
 ```powershell
 Get-ADDomainController -Filter * |
-Select Name,IPv4Address
+    Select-Object Name, IPv4Address
 ```
 
 ---
 
-# Loggar
+## Loggar
 
-## Visa DNS-loggen
+### Visa de senaste DNS Server-händelserna
 
 ```powershell
 Get-WinEvent `
-    -LogName "DNS Server" `
+    -LogName 'DNS Server' `
     -MaxEvents 20
 ```
 
 ---
 
-# Felsökning
+## Felsökning
 
-## DNS-test
+### Kör DNS-diagnostik på en Domain Controller
 
 ```cmd
 dcdiag /test:dns
 ```
 
-Kontrollerar:
-
-- DNS-registrering
-- SRV-poster
-- Replikering
-- Delegationer
-- Zonstatus
-
----
-
-## Replikeringsöversikt
+### Visa replikeringsöversikt
 
 ```cmd
 repadmin /replsummary
 ```
 
----
-
-## Visa replikeringsstatus
+### Visa detaljerad replikeringsstatus
 
 ```cmd
 repadmin /showrepl
 ```
 
----
-
-## Tvinga AD-replikering
+### Tvinga AD-replikering
 
 ```cmd
 repadmin /syncall /AdeP
@@ -448,55 +649,53 @@ repadmin /syncall /AdeP
 
 ---
 
-# Mina 10 viktigaste kommandon
+## Tio användbara vardagskommandon
 
 ```powershell
 Resolve-DnsName namn -Server dnsserver
-Resolve-DnsName ip -Type PTR
+Resolve-DnsName ip-adress -Type PTR
 
 Get-DnsServerZone
 Get-DnsServerResourceRecord -ZoneName zon
 
 Add-DnsServerResourceRecordA -CreatePtr
 
-Register-DnsClient
+Remove-DnsARecordWithPtr -Name namn -ZoneName zon -WhatIf
 
+Register-DnsClient
 Clear-DnsClientCache
 
 Get-DnsServerForwarder
 
 dcdiag /test:dns
-
 repadmin /replsummary
 ```
 
 ---
 
-# Vanliga RRType-värden
+## Vanliga RRType-värden
 
 | Typ | Beskrivning |
-|------|-------------|
-| A | IPv4-adress |
-| AAAA | IPv6-adress |
-| PTR | Reverse Lookup |
-| CNAME | Alias |
-| MX | Mailserver |
-| NS | Namnserver |
-| SOA | Start of Authority |
-| SRV | Active Directory-tjänster |
-| TXT | Textposter (SPF, DKIM m.m.) |
+|---|---|
+| `A` | IPv4-adress |
+| `AAAA` | IPv6-adress |
+| `PTR` | Reverse lookup |
+| `CNAME` | Alias |
+| `MX` | E-postserver |
+| `NS` | Namnserver |
+| `SOA` | Start of Authority |
+| `SRV` | Tjänstepost, bland annat för Active Directory |
+| `TXT` | Textdata, exempelvis SPF och verifieringsposter |
 
 ---
 
-# Tips
+## Hjälp och syntax
 
-### Visa hjälp
+### Fullständig hjälp
 
 ```powershell
 Get-Help Resolve-DnsName -Full
 ```
-
----
 
 ### Exempel
 
@@ -504,26 +703,14 @@ Get-Help Resolve-DnsName -Full
 Get-Help Add-DnsServerResourceRecordA -Examples
 ```
 
----
-
-### Sök cmdlets
+### Sök DNS-kommandon
 
 ```powershell
 Get-Command *Dns*
 ```
 
----
-
-### Sök parametrar
+### Visa syntax
 
 ```powershell
 Get-Command Set-DnsServerResourceRecord -Syntax
 ```
-
----
-
-> **Tips:** De flesta `DnsServer`-cmdlets kräver att modulen **DnsServer** finns installerad (ingår på Windows Server med DNS-rollen eller via RSAT på klienter). Kör vid behov:
->
-> ```powershell
-> Import-Module DnsServer
-> ```
