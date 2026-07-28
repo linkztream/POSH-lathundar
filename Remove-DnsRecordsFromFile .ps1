@@ -12,21 +12,23 @@ function Remove-DnsRecordsFromFile {
         [string]$Path,
 
         [Parameter()]
-        [string]$DnsServer = 'dc01',
+        [string]$DnsServer = 'pangdc01',
 
         [Parameter()]
-        [string]$ForwardZone = 'acme.com'
+        [string]$ForwardZone = 'pangkaka.com'
     )
 
-    $recordsToRemove = Get-Content -LiteralPath $Path |
-        ForEach-Object { $_.Trim() } |
-        Where-Object {
-            $_ -and
-            -not $_.StartsWith('#')
-        } |
-        Sort-Object -Unique
+    $recordsToRemove = @(
+        Get-Content -LiteralPath $Path |
+            ForEach-Object { $_.Trim() } |
+            Where-Object {
+                $_ -and
+                -not $_.StartsWith('#')
+            } |
+            Sort-Object -Unique
+    )
 
-    if (-not $recordsToRemove) {
+    if ($recordsToRemove.Count -eq 0) {
         Write-Warning "Filen innehåller inga DNS-namn."
         return
     }
@@ -47,6 +49,9 @@ function Remove-DnsRecordsFromFile {
         Write-Host "[$name]" -ForegroundColor Cyan
 
         try {
+            #
+            # Hämta A-post
+            #
             Write-Host "  Söker A-post..." -NoNewline
 
             $aRecords = @(
@@ -69,6 +74,9 @@ function Remove-DnsRecordsFromFile {
 
             Write-Host " hittad: $fqdn → $ip" -ForegroundColor Green
 
+            #
+            # Hämta PTR-post
+            #
             Write-Host "  Söker PTR-post..." -NoNewline
 
             $ptrInfo = ptr `
@@ -87,43 +95,110 @@ function Remove-DnsRecordsFromFile {
                     $ptrInfo.PTR
             ) -ForegroundColor Green
 
+            #
+            # Verifiera att PTR pekar tillbaka på samma FQDN
+            #
             $ptrTarget = $ptrInfo.PTR.ToString().TrimEnd('.')
 
             if ($ptrTarget -ine $fqdn) {
                 throw "PTR pekar på '$ptrTarget', inte på '$fqdn'."
             }
 
+            #
+            # WhatIf/Confirm
+            #
             if (-not $PSCmdlet.ShouldProcess(
                 "$fqdn och PTR $($ptrInfo.Node).$($ptrInfo.Zone)",
                 'Ta bort A- och PTR-post'
             )) {
                 Write-Host "  Hoppades över." -ForegroundColor Yellow
                 $skipped++
+                Write-Host ""
                 continue
             }
 
+            #
+            # Ta bort A-post
+            #
             Write-Host "  Tar bort A-post..." -NoNewline
 
-            $aRecord |
+            try {
                 Remove-DnsServerResourceRecord `
                     -ComputerName $DnsServer `
                     -ZoneName $ForwardZone `
+                    -Name $aRecord.HostName `
+                    -RRType A `
+                    -RecordData $ip `
                     -Force `
                     -ErrorAction Stop
 
-            Write-Host " klar" -ForegroundColor Green
+                Write-Host " klar" -ForegroundColor Green
+            }
+            catch {
+                $aStillExists = @(
+                    Get-DnsServerResourceRecord `
+                        -ComputerName $DnsServer `
+                        -ZoneName $ForwardZone `
+                        -Name $aRecord.HostName `
+                        -RRType A `
+                        -Node `
+                        -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.RecordData.IPv4Address.IPAddressToString -eq $ip
+                    }
+                )
 
+                if ($aStillExists.Count -eq 0) {
+                    Write-Host (
+                        " klar, men DNS-cmdleten rapporterade fel efter borttagningen"
+                    ) -ForegroundColor Yellow
+                }
+                else {
+                    throw
+                }
+            }
+
+            #
+            # Ta bort PTR-post
+            #
             Write-Host "  Tar bort PTR-post..." -NoNewline
 
-            Remove-DnsServerResourceRecord `
-                -ComputerName $DnsServer `
-                -ZoneName $ptrInfo.Zone `
-                -Name $ptrInfo.Node `
-                -RRType PTR `
-                -RecordData $ptrInfo.PTR `
-                -Force `
-                -ErrorAction Stop
-            Write-Host " klar" -ForegroundColor Green
+            try {
+                Remove-DnsServerResourceRecord `
+                    -ComputerName $DnsServer `
+                    -ZoneName $ptrInfo.Zone `
+                    -Name $ptrInfo.Node `
+                    -RRType PTR `
+                    -RecordData $ptrInfo.PTR `
+                    -Force `
+                    -ErrorAction Stop
+
+                Write-Host " klar" -ForegroundColor Green
+            }
+            catch {
+                $ptrStillExists = @(
+                    Get-DnsServerResourceRecord `
+                        -ComputerName $DnsServer `
+                        -ZoneName $ptrInfo.Zone `
+                        -Name $ptrInfo.Node `
+                        -RRType PTR `
+                        -Node `
+                        -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.RecordData.PtrDomainName.ToString().TrimEnd('.') -ieq
+                        $ptrTarget
+                    }
+                )
+
+                if ($ptrStillExists.Count -eq 0) {
+                    Write-Host (
+                        " klar, men DNS-cmdleten rapporterade fel efter borttagningen"
+                    ) -ForegroundColor Yellow
+                }
+                else {
+                    throw
+                }
+            }
 
             $success++
         }
