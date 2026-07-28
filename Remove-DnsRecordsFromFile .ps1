@@ -115,13 +115,14 @@ function Remove-DnsRecordsFromFile {
 
             Write-Host "  Tar bort PTR-post..." -NoNewline
 
-            $ptrInfo.Record |
-                Remove-DnsServerResourceRecord `
-                    -ComputerName $DnsServer `
-                    -ZoneName $ptrInfo.Zone `
-                    -Force `
-                    -ErrorAction Stop
-
+            Remove-DnsServerResourceRecord `
+                -ComputerName $DnsServer `
+                -ZoneName $ptrInfo.Zone `
+                -Name $ptrInfo.Node `
+                -RRType PTR `
+                -RecordData $ptrInfo.PTR `
+                -Force `
+                -ErrorAction Stop
             Write-Host " klar" -ForegroundColor Green
 
             $success++
