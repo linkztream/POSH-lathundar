@@ -1,0 +1,39 @@
+;
+;  Database file 16.0.10.in-addr.arpa.dns for 16.0.10.in-addr.arpa zone.
+;      Zone version:  184
+;
+
+@                       IN  SOA dc01.contoso.local. hostmaster.contoso.local. (
+			  		184          ; serial number
+			  		900          ; refresh
+			  		600          ; retry
+			  		86400        ; expire
+			  		3600       ) ; default TTL
+
+;
+;  Zone NS records
+;
+
+@			NS	dc01.contoso.local.
+@			NS	dc02.contoso.local.
+
+;
+;  Zone records
+;
+
+$ORIGIN 16.0.10.in-addr.arpa.
+1			PTR	contoso.local.
+10			PTR	dc01.contoso.local.
+11	[AGE:3636304]	PTR	dc02.contoso.local.
+20			PTR	srv01.contoso.local.
+21	[AGE:3636304]	PTR	srv02.contoso.local.
+30			PTR	web01.contoso.local.
+			WINSR	L1 C2 contoso.local.
+40			PTR	fs01.contoso.local.
+50			PTR	print01.contoso.local.
+51	3600	IN	PTR	print01.contoso.local.
+; 90 och 91 är föräldralösa: målnamnen saknas helt i forward-zone.txt
+90			PTR	gammal-srv.contoso.local.
+91	[AGE:3630001]	PTR	avvecklad.contoso.local.
+; 99 pekar på ett namn som finns, men vars A-post har en annan IP (10.0.16.31)
+99.16.0.10.in-addr.arpa.	PTR	web02.contoso.local.

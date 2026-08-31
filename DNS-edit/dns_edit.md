@@ -449,7 +449,7 @@ Get-DnsServerResourceRecord -ZoneName zon
 
 Add-DnsServerResourceRecordA -CreatePtr
 
-Remove-DnsARecordWithPtr -Name namn -ZoneName zon -WhatIf
+Remove-DnsHostRecord -Name namn -ComputerName server -WhatIf
 
 Register-DnsClient
 Clear-DnsClientCache
@@ -459,6 +459,11 @@ Get-DnsServerForwarder
 dcdiag /test:dns
 repadmin /replsummary
 ```
+
+> `Remove-DnsHostRecord` ingår i modulen **DnsLathund** — all hantering av
+> A+PTR-par (sökning, städning av föräldralösa PTR och interaktiv redigering)
+> bor numera där. Importera den med `Import-Module .\DnsLathund` och se
+> `README.md` för detaljer.
 
 ---
 
