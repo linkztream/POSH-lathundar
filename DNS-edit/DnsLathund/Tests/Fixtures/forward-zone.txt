@@ -1,0 +1,48 @@
+;
+;  Database file contoso.local.dns for contoso.local zone.
+;      Zone version:  247
+;
+
+@                       IN  SOA dc01.contoso.local. hostmaster.contoso.local. (
+			  		247          ; serial number
+			  		900          ; refresh
+			  		600          ; retry
+			  		86400        ; expire
+			  		3600       ) ; default TTL
+
+;
+;  Zone NS records
+;
+
+@			NS	dc01.contoso.local.
+@			NS	dc02.contoso.local.
+
+;
+;  Zone records
+;
+
+$ORIGIN contoso.local.
+@			A	10.0.16.1
+			A	10.0.16.2
+dc01			A	10.0.16.10
+dc02	[AGE:3636304]	A	10.0.16.11
+srv01			A	10.0.16.20
+srv02	[AGE:3636304]	A	10.0.16.21
+web01			A	10.0.16.30
+web02			A	10.0.16.31
+fs01.contoso.local.	A	10.0.16.40
+; print01 har medvetet två A-poster (den andra ärver ägaren från raden ovan)
+print01			A	10.0.16.50
+			A	10.0.16.51
+mail01	3600	IN	A	10.0.16.55
+			WINS	L1 C2 ( 10.0.16.10 10.0.16.11 )
+gw			CNAME	dc01.contoso.local.
+
+;
+;  Delegerad underzon i samma exportfil
+;
+
+$ORIGIN lab.contoso.local.
+@			NS	dc01.contoso.local.
+test01			A	10.0.16.60
+test02	[AGE:3636290]	A	10.0.16.61
