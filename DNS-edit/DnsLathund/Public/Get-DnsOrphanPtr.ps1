@@ -73,13 +73,20 @@
     $zoneTable = Get-DnsZoneTable -ComputerName $ComputerName @credentialParameters
 
     # Bara primära zoner är intressanta: sekundära och stub-zoner ägs inte av
-    # den här servern och ska varken exporteras eller städas här.
+    # den här servern och ska varken exporteras eller städas här. Auto-skapade
+    # zoner (0/127/255.in-addr.arpa) är tekniskt Primary men går inte att
+    # exportera — Export-DnsServerZone felar på dem (verifierat mot riktig
+    # server 2026-09-03).
     $primaryZoneNames = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase
     )
 
     foreach ($zone in @($zoneTable.AllZones)) {
-        if ($null -ne $zone -and $zone.ZoneType -eq 'Primary') {
+        if (
+            $null -ne $zone -and
+            $zone.ZoneType -eq 'Primary' -and
+            -not $zone.IsAutoCreated
+        ) {
             $null = $primaryZoneNames.Add([string]$zone.ZoneName)
         }
     }
@@ -97,8 +104,12 @@
         $selectedForwardZones = @($ForwardZone)
     }
     else {
+        # TrustAnchors är en Primary-zon för DNSSEC-ankare — inga A-poster,
+        # och Export-DnsServerZone kan inte exportera den.
         $selectedForwardZones = @(
-            $zoneTable.ForwardZones | Where-Object { $primaryZoneNames.Contains($_) }
+            $zoneTable.ForwardZones | Where-Object {
+                $primaryZoneNames.Contains($_) -and $_ -ne 'TrustAnchors'
+            }
         )
     }
 
@@ -274,6 +285,12 @@
 
             $canonicalReverseZone = ConvertTo-CanonicalDnsName -Name $reverseZoneName
 
+            # En reverse-zon som inte går att läsa (t.ex. export-vägran) fäller
+            # inte hela svepet — den varnas och hoppas över. Det är säkert här:
+            # ett bortfall i reverse-ledet kan bara ge FÄRRE träffar, aldrig
+            # falska orphans. (Forwardzonerna hanteras tvärtom — ett bortfall
+            # där gör A-indexet ofullständigt och avbryter körningen.)
+            try {
             & $ptrProducer $reverseZoneName |
                 ForEach-Object {
                     $ownerFqdn = ConvertTo-CanonicalDnsName -Name ([string]$_.OwnerFqdn)
@@ -349,6 +366,10 @@
                         -Status $status `
                         -ComputerName $ComputerName
                 }
+            }
+            catch {
+                Write-Warning "Reverse-zonen '$reverseZoneName' kunde inte läsas och hoppas över: $($_.Exception.Message)"
+            }
         }
 
         Write-Progress -Id 2 -Activity 'Söker föräldralösa PTR-poster' -Completed

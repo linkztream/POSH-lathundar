@@ -239,17 +239,27 @@ Describe 'Find-DnsRecord' {
         }
     }
 
-    It 'bygger ett WQL-mönster mot fullständigt FQDN och slår upp träffarna' {
-        InModuleScope DnsLathund {
-            Mock Get-DnsCimSession {
-                [Microsoft.Management.Infrastructure.CimSession]::Create('dc01')
-            }
+    It 'FQDN-iserar mönstret, deduplicerar ägare och slår upp träffarna via zonexport' {
+        $exportPath = Join-Path -Path $TestDrive -ChildPath 'contoso.local.dns'
+        Set-Content -LiteralPath $exportPath -Value '; syntetisk zonexport' -Encoding UTF8
 
-            Mock Get-CimInstance {
-                [PSCustomObject]@{ OwnerName = 'web01.contoso.local.'; IPAddress = '10.0.16.11' }
-                [PSCustomObject]@{ OwnerName = 'web02.contoso.local'; IPAddress = '10.0.16.12' }
+        # Mockkroppar körs i modulens scope och ser inte InModuleScope-
+        # parametrarna, därför går sökvägen via en global variabel.
+        $global:DnsLathundTestExportPath = $exportPath
+
+        InModuleScope DnsLathund {
+            # Wildcard får aldrig gå via CIM — DNS-providern stödjer inte LIKE
+            # och returnerar tyst noll rader (verifierat mot riktig server).
+            Mock Get-DnsCimSession { throw 'Get-DnsCimSession ska inte anropas vid wildcard-sökning.' }
+            Mock Get-CimInstance { throw 'Get-CimInstance ska inte anropas vid wildcard-sökning.' }
+            Mock Export-DnsZoneFile { $global:DnsLathundTestExportPath }
+
+            Mock ConvertFrom-DnsZoneFile {
+                [PSCustomObject]@{ OwnerFqdn = 'web01.contoso.local'; RecordType = 'A'; RecordData = '10.0.16.11' }
+                [PSCustomObject]@{ OwnerFqdn = 'web02.contoso.local'; RecordType = 'A'; RecordData = '10.0.16.12' }
                 # Dubblett: två A-poster på samma ägare ska bara ge ett uppslag.
-                [PSCustomObject]@{ OwnerName = 'WEB02.contoso.local'; IPAddress = '10.0.16.13' }
+                [PSCustomObject]@{ OwnerFqdn = 'WEB02.contoso.local'; RecordType = 'A'; RecordData = '10.0.16.13' }
+                [PSCustomObject]@{ OwnerFqdn = 'db01.contoso.local'; RecordType = 'A'; RecordData = '10.0.16.20' }
             }
 
             Mock Resolve-DnsRecordPair {
@@ -262,73 +272,6 @@ Describe 'Find-DnsRecord' {
 
             $result.Count | Should -Be 2
 
-            Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter {
-                $Namespace -eq 'root\MicrosoftDNS' -and
-                $OperationTimeoutSec -eq 300 -and
-                $Query -eq (
-                    "SELECT OwnerName, IPAddress FROM MicrosoftDNS_AType " +
-                    "WHERE ContainerName='contoso.local' AND OwnerName LIKE 'web%.contoso.local'"
-                )
-            }
-
-            Should -Invoke Resolve-DnsRecordPair -Times 2 -Exactly
-            Should -Invoke Resolve-DnsRecordPair -Times 1 -Exactly -ParameterFilter {
-                $Identity -eq 'web01.contoso.local' -and $ZoneName -eq 'contoso.local'
-            }
-        }
-    }
-
-    It 'lämnar ett mönster som redan innehåller punkt orört' {
-        InModuleScope DnsLathund {
-            Mock Get-DnsCimSession {
-                [Microsoft.Management.Infrastructure.CimSession]::Create('dc01')
-            }
-
-            Mock Get-CimInstance { }
-            Mock Resolve-DnsRecordPair { }
-
-            $null = Find-DnsRecord -Identity 'web*.contoso.local' -ComputerName 'dc01' `
-                -ZoneName 'contoso.local' -WarningAction SilentlyContinue
-
-            Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter {
-                $Query -like "*OwnerName LIKE 'web%.contoso.local'"
-            }
-        }
-    }
-
-    It 'faller tillbaka på zonexport när CIM inte är nåbart' {
-        $exportPath = Join-Path -Path $TestDrive -ChildPath 'contoso.local.dns'
-        Set-Content -LiteralPath $exportPath -Value '; syntetisk zonexport' -Encoding UTF8
-
-        # Mockkroppar körs i modulens scope och ser inte InModuleScope-
-        # parametrarna, därför går sökvägen via en global variabel.
-        $global:DnsLathundTestExportPath = $exportPath
-
-        InModuleScope DnsLathund {
-            Mock Get-DnsCimSession { }
-            Mock Get-CimInstance { throw 'Get-CimInstance ska inte anropas i fallbackvägen.' }
-            Mock Export-DnsZoneFile { $global:DnsLathundTestExportPath }
-
-            Mock ConvertFrom-DnsZoneFile {
-                [PSCustomObject]@{ OwnerFqdn = 'web01.contoso.local'; IPv4Address = '10.0.16.11' }
-                [PSCustomObject]@{ OwnerFqdn = 'db01.contoso.local'; IPv4Address = '10.0.16.20' }
-            }
-
-            Mock Resolve-DnsRecordPair {
-                New-DnsRecordPairObject -Name $Identity -ComputerName 'dc01'
-            }
-
-            $warnings = @()
-
-            $result = @(
-                Find-DnsRecord -Identity 'web*' -ComputerName 'dc01' -ZoneName 'contoso.local' `
-                    -WarningAction SilentlyContinue -WarningVariable warnings
-            )
-
-            $result.Count | Should -Be 1
-
-            @($warnings)[0].Message | Should -BeExactly 'CIM-namnrymden root\MicrosoftDNS gick inte att nå – använder zonexport i stället (långsammare).'
-
             Should -Invoke Export-DnsZoneFile -Times 1 -Exactly -ParameterFilter {
                 $ZoneName -eq 'contoso.local' -and $ComputerName -eq 'dc01'
             }
@@ -337,9 +280,11 @@ Describe 'Find-DnsRecord' {
                 $RecordType -eq 'A'
             }
 
-            # Klientsidig -like-matchning mot det FQDN-iserade mönstret.
+            # Klientsidig -like-matchning mot det FQDN-iserade mönstret
+            # 'web*.contoso.local' — db01 ska inte slås upp.
+            Should -Invoke Resolve-DnsRecordPair -Times 2 -Exactly
             Should -Invoke Resolve-DnsRecordPair -Times 1 -Exactly -ParameterFilter {
-                $Identity -eq 'web01.contoso.local'
+                $Identity -eq 'web01.contoso.local' -and $ZoneName -eq 'contoso.local'
             }
         }
 
@@ -347,6 +292,35 @@ Describe 'Find-DnsRecord' {
 
         # Temporärfilen städas i finally-blocket.
         Test-Path -LiteralPath $exportPath | Should -BeFalse
+    }
+
+    It 'lämnar ett mönster som redan innehåller punkt orört' {
+        $exportPath = Join-Path -Path $TestDrive -ChildPath 'contoso2.local.dns'
+        Set-Content -LiteralPath $exportPath -Value '; syntetisk zonexport' -Encoding UTF8
+
+        $global:DnsLathundTestExportPath = $exportPath
+
+        InModuleScope DnsLathund {
+            Mock Export-DnsZoneFile { $global:DnsLathundTestExportPath }
+
+            Mock ConvertFrom-DnsZoneFile {
+                [PSCustomObject]@{ OwnerFqdn = 'web01.contoso.local'; RecordType = 'A'; RecordData = '10.0.16.11' }
+            }
+
+            Mock Resolve-DnsRecordPair {
+                New-DnsRecordPairObject -Name $Identity -ForwardZone 'contoso.local' -ComputerName 'dc01'
+            }
+
+            $result = @(
+                Find-DnsRecord -Identity 'web*.contoso.local' -ComputerName 'dc01' -ZoneName 'contoso.local'
+            )
+
+            # Hade mönstret felaktigt kompletterats till
+            # 'web*.contoso.local.contoso.local' hade inget matchat.
+            $result.Count | Should -Be 1
+        }
+
+        Remove-Item -LiteralPath 'variable:global:DnsLathundTestExportPath' -Force -ErrorAction SilentlyContinue
     }
 
     It 'varnar och returnerar ingenting när inget matchar' {

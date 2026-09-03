@@ -9,9 +9,10 @@ Ersätter de tidigare lösa scripten `Remove-DnsRecordsFromFile .ps1` och
 - **550 000 poster i en zon.** Ett ofiltrerat `Get-DnsServerResourceRecord
   -ZoneName zon` ger timeout långt innan det returnerar något. Modulen gör
   därför **aldrig** ofiltrerad zon-enumeration. Punktuppslag går via `-Name`,
-  mönstersökning via CIM/WQL (`root\MicrosoftDNS`, `LIKE`) och helzonssvep via
-  `Export-DnsServerZone` plus en egen BIND-parser som läser filen rad för rad
-  med `[System.IO.File]::ReadLines()`.
+  mönstersökning och helzonssvep via `Export-DnsServerZone` plus en egen
+  BIND-parser som läser filen rad för rad med `[System.IO.File]::ReadLines()`.
+  (CIM/WQL används för zonfiltrerade frågor i `Get-DnsOrphanPtr -Method Cim`,
+  men inte för mönster — DNS-providern stödjer inte `LIKE`.)
 - **Det kosmetiska felet på Server 2022/2025.** Parameteruppsättningen
   `Remove-DnsServerResourceRecord -Name ... -RRType ... -RecordData ...`
   *raderar posten men felrapporterar ändå*. Modulen tar därför bort poster
@@ -64,8 +65,8 @@ relationen klassificerad (`1:1`, `PTR saknas`, `PTR pekar på annat namn`,
 `Matchande PTR finns, men relationen är inte 1:1`).
 
 Indata kan vara ett namn, en IPv4-adress (reverse-uppslag först) eller ett
-wildcardmönster. Wildcard kräver `-ZoneName` och går via CIM/WQL; är CIM inte
-nåbart faller sökningen tillbaka på en zonexport med en varning.
+wildcardmönster. Wildcard kräver `-ZoneName` och går via zonexport + parsning
+(WQL `LIKE` stöds inte av DNS-providern — den returnerar tyst noll rader).
 
 ```powershell
 Find-DnsRecord -Identity 'srv01.contoso.local' -ComputerName 'dc01'
@@ -273,13 +274,13 @@ i en **testzon**, aldrig i produktion.
 - **Klasslösa reverse-zoner enligt RFC 2317 stöds inte.** Zoner med `/` i namnet
   (exempelvis `0/25.16.0.10.in-addr.arpa`) hoppas över med en varning i stället
   för att tolkas fel.
-- **WQL-frågeformerna bör verifieras mot en riktig server vid första körningen.**
-  Särskilt projektionen av `PTRDomainName` i `MicrosoftDNS_PTRType` och
-  slutpunktstoleransen (`PTRDomainName = 'x' OR PTRDomainName = 'x.'`) är
-  utvecklade mot dokumentationen och testade offline. Kör
-  `Find-DnsRecord -Identity '<mönster>' -ZoneName <zon> -Verbose` en gång mot
-  skarp miljö och jämför resultatet med `-Method ZoneExport`-vägen
-  (`Get-DnsOrphanPtr`) innan CIM-vägen litas på i bulk.
+- **WQL `LIKE` fungerar inte mot DNS-providern.** Verifierat mot riktig server
+  (2026-09-03): `root\MicrosoftDNS` stödjer inte `LIKE`-operatorn och
+  returnerar **tyst noll rader** i stället för ett fel. Wildcard-sökning i
+  `Find-DnsRecord` går därför alltid via zonexport + parsning. Exakt match
+  (`=`) och zonfiltrering (`ContainerName='zon'`) fungerar däremot, så
+  `Get-DnsOrphanPtr -Method Cim` är verifierad live, inklusive
+  `PTRDomainName`-projektionen.
 
 ## Utvecklingsanteckningar
 

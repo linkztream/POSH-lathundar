@@ -9,23 +9,23 @@
 
             Dispatch:
             - IPv4-adress: reverse-uppslag följt av A-uppslag.
-            - Wildcardmönster: CIM/WQL-sökning i root\MicrosoftDNS (kräver
-              -ZoneName). Är CIM inte nåbart används zonexport som reserv, med
-              en varning.
+            - Wildcardmönster: zonexport + parsning (kräver -ZoneName). WQL med
+              LIKE mot root\MicrosoftDNS är inte ett alternativ — DNS-providern
+              stödjer inte LIKE-operatorn och returnerar tyst noll rader.
             - Exakt namn: punktuppslag via -Name.
 
-            Ofiltrerad zon-enumeration används aldrig — zonerna i den här miljön
-            kan innehålla hundratusentals poster.
+            Ofiltrerad zon-enumeration via cmdletarna används aldrig — zonerna
+            i den här miljön kan innehålla hundratusentals poster. Exportvägen
+            parsar zonfilen strömmande och klarar den storleken på sekunder.
 
-            Om wildcardsökning: WQL-egenskapen OwnerName innehåller ett
-            fullständigt FQDN, inte nodnamnet. Mönster utan punkt kompletteras
-            därför automatiskt med zonen, så att 'web*' i zonen
-            'contoso.local' blir mönstret 'web*.contoso.local' och filtret
-            "OwnerName LIKE 'web%.contoso.local'". Innehåller mönstret redan en
-            punkt används det som det är — då förutsätts anroparen ha skrivit
-            ett fullständigt mönster.
+            Om wildcardsökning: matchningen görs mot postens fullständiga FQDN,
+            inte nodnamnet. Mönster utan punkt kompletteras därför automatiskt
+            med zonen, så att 'web*' i zonen 'contoso.local' blir mönstret
+            'web*.contoso.local'. Innehåller mönstret redan en punkt används
+            det som det är — då förutsätts anroparen ha skrivit ett
+            fullständigt mönster.
 
-            Varje CIM-träff slås därefter upp punktvis med Resolve-DnsRecordPair
+            Varje träff slås därefter upp punktvis med Resolve-DnsRecordPair
             för att få PTR-relationen klassificerad. Ett mycket brett mönster som
             ger tusentals träffar innebär alltså tusentals punktuppslag — håll
             mönstren smala.
@@ -45,7 +45,7 @@
         .EXAMPLE
             Find-DnsRecord -Identity 'web*' -ComputerName 'dc01' -ZoneName 'contoso.local'
 
-            Mönstersökning via CIM/WQL.
+            Mönstersökning via zonexport.
     #>
     [CmdletBinding()]
     [OutputType([PSCustomObject])]
@@ -115,7 +115,7 @@
                     continue
                 }
 
-                # OwnerName i WQL är ett fullständigt FQDN. Ett mönster utan
+                # Matchningen görs mot fullständigt FQDN. Ett mönster utan
                 # punkt kompletteras därför med zonen.
                 $searchPattern = if ($current.Contains('.')) {
                     $current
@@ -129,87 +129,52 @@
                     [System.StringComparer]::OrdinalIgnoreCase
                 )
 
-                $cimSession = Get-DnsCimSession -ComputerName $ComputerName @credentialSplat
+                # Wildcard går via zonexport + parser. Den till synes självklara
+                # vägen — WQL med LIKE mot root\MicrosoftDNS — fungerar inte:
+                # DNS-providern stödjer inte LIKE-operatorn och returnerar tyst
+                # noll rader (verifierat mot riktig server 2026-09-03).
+                # Exportvägen skalar dessutom till zoner med hundratusentals
+                # poster.
+                $exportPath = $null
 
-                if ($null -ne $cimSession) {
-                    $escapedZone = $normalizedZone.Replace("'", "''")
-                    $wqlFilter = New-DnsWqlFilter -Pattern $searchPattern -Property 'OwnerName'
+                try {
+                    $exportPath = Export-DnsZoneFile `
+                        -ZoneName $normalizedZone `
+                        -ComputerName $ComputerName `
+                        @credentialSplat
 
-                    $query = "SELECT OwnerName, IPAddress FROM MicrosoftDNS_AType " +
-                        "WHERE ContainerName='$escapedZone' AND $wqlFilter"
+                    $zoneRecords = @(
+                        ConvertFrom-DnsZoneFile `
+                            -Path $exportPath `
+                            -ZoneName $normalizedZone `
+                            -RecordType A
+                    )
 
-                    Write-Verbose "WQL mot '$ComputerName': $query"
+                    foreach ($zoneRecord in $zoneRecords) {
+                        $ownerFqdn = ConvertTo-CanonicalDnsName -Name $zoneRecord.OwnerFqdn
 
-                    try {
-                        $cimResults = @(
-                            Get-CimInstance `
-                                -CimSession $cimSession `
-                                -Namespace 'root\MicrosoftDNS' `
-                                -Query $query `
-                                -OperationTimeoutSec 300 `
-                                -ErrorAction Stop
-                        )
-                    }
-                    catch {
-                        $PSCmdlet.WriteError($_)
-                        continue
-                    }
-
-                    foreach ($cimResult in $cimResults) {
-                        $ownerFqdn = ConvertTo-CanonicalDnsName -Name $cimResult.OwnerName
+                        if ([string]::IsNullOrWhiteSpace($ownerFqdn)) {
+                            continue
+                        }
 
                         if (
-                            -not [string]::IsNullOrWhiteSpace($ownerFqdn) -and
+                            $ownerFqdn -like $searchPattern -and
                             $seenOwners.Add($ownerFqdn)
                         ) {
                             $ownerNames.Add($ownerFqdn)
                         }
                     }
                 }
-                else {
-                    Write-Warning 'CIM-namnrymden root\MicrosoftDNS gick inte att nå – använder zonexport i stället (långsammare).'
-
-                    $exportPath = $null
-
-                    try {
-                        $exportPath = Export-DnsZoneFile `
-                            -ZoneName $normalizedZone `
-                            -ComputerName $ComputerName `
-                            @credentialSplat
-
-                        $zoneRecords = @(
-                            ConvertFrom-DnsZoneFile `
-                                -Path $exportPath `
-                                -ZoneName $normalizedZone `
-                                -RecordType A
-                        )
-
-                        foreach ($zoneRecord in $zoneRecords) {
-                            $ownerFqdn = ConvertTo-CanonicalDnsName -Name $zoneRecord.OwnerFqdn
-
-                            if ([string]::IsNullOrWhiteSpace($ownerFqdn)) {
-                                continue
-                            }
-
-                            if (
-                                $ownerFqdn -like $searchPattern -and
-                                $seenOwners.Add($ownerFqdn)
-                            ) {
-                                $ownerNames.Add($ownerFqdn)
-                            }
-                        }
-                    }
-                    catch {
-                        $PSCmdlet.WriteError($_)
-                        continue
-                    }
-                    finally {
-                        if (
-                            -not [string]::IsNullOrWhiteSpace($exportPath) -and
-                            (Test-Path -LiteralPath $exportPath -ErrorAction SilentlyContinue)
-                        ) {
-                            Remove-Item -LiteralPath $exportPath -Force -ErrorAction SilentlyContinue
-                        }
+                catch {
+                    $PSCmdlet.WriteError($_)
+                    continue
+                }
+                finally {
+                    if (
+                        -not [string]::IsNullOrWhiteSpace($exportPath) -and
+                        (Test-Path -LiteralPath $exportPath -ErrorAction SilentlyContinue)
+                    ) {
+                        Remove-Item -LiteralPath $exportPath -Force -ErrorAction SilentlyContinue
                     }
                 }
 
