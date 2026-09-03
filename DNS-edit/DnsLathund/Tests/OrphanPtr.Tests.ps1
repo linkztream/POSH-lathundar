@@ -495,3 +495,99 @@ Describe 'Remove-DnsPtrRecord' {
         Should -Invoke -CommandName Get-DnsServerResourceRecord -ModuleName DnsLathund -Times 0 -Exactly
     }
 }
+
+
+Describe 'Get-DnsOrphanPtr — zonurval och feltålighet' {
+
+    BeforeEach {
+        Mock -CommandName Assert-DnsServerModule -ModuleName DnsLathund -MockWith { }
+
+        # Zontabell med auto-skapade zoner och TrustAnchors — sådana finns på
+        # varje riktig DC och gick före fixen sönder i defaultsvepet:
+        # Export-DnsServerZone kan inte exportera dem (verifierat live).
+        Mock -CommandName Get-DnsZoneTable -ModuleName DnsLathund -MockWith {
+            [PSCustomObject]@{
+                AllZones     = @(
+                    [PSCustomObject]@{ ZoneName = 'contoso.local'; ZoneType = 'Primary'; IsReverseLookupZone = $false; IsAutoCreated = $false }
+                    [PSCustomObject]@{ ZoneName = 'TrustAnchors'; ZoneType = 'Primary'; IsReverseLookupZone = $false; IsAutoCreated = $false }
+                    [PSCustomObject]@{ ZoneName = '16.0.10.in-addr.arpa'; ZoneType = 'Primary'; IsReverseLookupZone = $true; IsAutoCreated = $false }
+                    [PSCustomObject]@{ ZoneName = '0.in-addr.arpa'; ZoneType = 'Primary'; IsReverseLookupZone = $true; IsAutoCreated = $true }
+                    [PSCustomObject]@{ ZoneName = '127.in-addr.arpa'; ZoneType = 'Primary'; IsReverseLookupZone = $true; IsAutoCreated = $true }
+                )
+                ForwardZones = [string[]]@('contoso.local', 'TrustAnchors')
+                ReverseZones = [string[]]@('16.0.10.in-addr.arpa', '0.in-addr.arpa', '127.in-addr.arpa')
+            }
+        }
+
+        Mock -CommandName Export-DnsZoneFile -ModuleName DnsLathund -MockWith {
+            $fixturePath = if ($ZoneName -like '*.in-addr.arpa') {
+                $global:DnsLathundTestState.ReverseFixture
+            }
+            else {
+                $global:DnsLathundTestState.ForwardFixture
+            }
+
+            $copyPath = Join-Path -Path $global:DnsLathundTestState.TemporaryZoneRoot -ChildPath (
+                '{0}.txt' -f [guid]::NewGuid().ToString('N')
+            )
+
+            Copy-Item -LiteralPath $fixturePath -Destination $copyPath -Force
+
+            $copyPath
+        }
+    }
+
+    It 'utesluter auto-skapade zoner och TrustAnchors ur defaultsvepet' {
+        $result = @(Get-DnsOrphanPtr -ComputerName 'dc01' -WarningAction SilentlyContinue)
+
+        # Svepet ska fungera och bara röra de riktiga zonerna.
+        $result.Count | Should -Be 2
+
+        Should -Invoke -CommandName Export-DnsZoneFile -ModuleName DnsLathund -Times 0 -Exactly -ParameterFilter {
+            $ZoneName -in @('0.in-addr.arpa', '127.in-addr.arpa', 'TrustAnchors')
+        }
+    }
+
+    It 'varnar och fortsätter när en reverse-zon inte kan exporteras' {
+        # 16.0.10-zonen felar; den auto-skapade filtreringen testas ovan, så
+        # här får den trasiga zonen sällskap av en frisk.
+        Mock -CommandName Get-DnsZoneTable -ModuleName DnsLathund -MockWith {
+            [PSCustomObject]@{
+                AllZones     = @(
+                    [PSCustomObject]@{ ZoneName = 'contoso.local'; ZoneType = 'Primary'; IsReverseLookupZone = $false; IsAutoCreated = $false }
+                    [PSCustomObject]@{ ZoneName = '16.0.10.in-addr.arpa'; ZoneType = 'Primary'; IsReverseLookupZone = $true; IsAutoCreated = $false }
+                    [PSCustomObject]@{ ZoneName = 'trasig.17.0.10.in-addr.arpa'; ZoneType = 'Primary'; IsReverseLookupZone = $true; IsAutoCreated = $false }
+                )
+                ForwardZones = [string[]]@('contoso.local')
+                ReverseZones = [string[]]@('trasig.17.0.10.in-addr.arpa', '16.0.10.in-addr.arpa')
+            }
+        }
+
+        Mock -CommandName Export-DnsZoneFile -ModuleName DnsLathund -ParameterFilter {
+            $ZoneName -eq 'trasig.17.0.10.in-addr.arpa'
+        } -MockWith {
+            throw "Kunde inte exportera zonen 'trasig.17.0.10.in-addr.arpa' på 'dc01': testfel."
+        }
+
+        $streams = Get-DnsOrphanPtr -ComputerName 'dc01' 3>&1
+
+        $warnings = @($streams | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+        $result = @($streams | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] })
+
+        "$warnings" | Should -Match "Reverse-zonen 'trasig\.17\.0\.10\.in-addr\.arpa' kunde inte läsas och hoppas över"
+
+        # Den friska zonens orphans kommer ändå.
+        $result.Count | Should -Be 2
+    }
+
+    It 'avbryter när en forwardzon inte kan exporteras (ofullständigt A-index vore farligt)' {
+        Mock -CommandName Export-DnsZoneFile -ModuleName DnsLathund -ParameterFilter {
+            $ZoneName -eq 'contoso.local'
+        } -MockWith {
+            throw "Kunde inte exportera zonen 'contoso.local' på 'dc01': testfel."
+        }
+
+        { Get-DnsOrphanPtr -ComputerName 'dc01' -WarningAction SilentlyContinue -ErrorAction Stop } |
+            Should -Throw '*contoso.local*'
+    }
+}
