@@ -15,6 +15,9 @@
 
     Datorer som ligger i containrar (CN=...) under OU:t tas också med.
 
+    Scriptet använder bara PowerShell-kärntyper och fungerar därför även i
+    Constrained Language Mode (t.ex. under AppLocker/WDAC).
+
     Kräver modulen ActiveDirectory (RSAT).
 
 .PARAMETER SearchBase
@@ -100,7 +103,7 @@ function Get-RdnValue {
         [string]$DistinguishedName
     )
 
-    $rdn   = [regex]::Match($DistinguishedName, '^(?:[^,\\]|\\.)+').Value
+    $rdn = if ($DistinguishedName -match '^(?:[^,\\]|\\.)+') { $Matches[0] } else { $DistinguishedName }
     $value = $rdn -replace '^[^=]+=', ''
 
     # Ta bort escape-tecken, t.ex. "Test\, Lab" -> "Test, Lab"
@@ -120,12 +123,14 @@ function New-TreeNode {
         [string]$Type
     )
 
-    return [PSCustomObject]@{
+    # New-Object i stället för [PSCustomObject]@{} och vanliga arrayer i stället för List<T>,
+    # eftersom båda de senare stoppas i Constrained Language Mode
+    return New-Object -TypeName PSObject -Property @{
         Name              = $Name
         DistinguishedName = $DistinguishedName
         Type              = $Type
-        Children          = [System.Collections.Generic.List[object]]::new()
-        Computers         = [System.Collections.Generic.List[object]]::new()
+        Children          = @()
+        Computers         = @()
     }
 }
 
@@ -154,7 +159,7 @@ function Resolve-ParentNode {
 
     $rootDn      = $Root.DistinguishedName
     $isBelowRoot = $parentDn.Length -gt $rootDn.Length -and
-        $parentDn.EndsWith(",$rootDn", [StringComparison]::OrdinalIgnoreCase)
+        $parentDn.ToLower().EndsWith(",$rootDn".ToLower())
 
     if (-not $isBelowRoot) {
         # Säkerhetsnät: objekt som inte hör hemma under roten läggs direkt på roten
@@ -167,7 +172,7 @@ function Resolve-ParentNode {
     $Nodes[$parentDn] = $node
 
     $grandParent = Resolve-ParentNode -Nodes $Nodes -DistinguishedName $parentDn -Root $Root
-    $grandParent.Children.Add($node)
+    $grandParent.Children += $node
 
     return $node
 }
@@ -251,7 +256,7 @@ function Get-AdServerTree {
 
     foreach ($ou in $ous) {
         $parent = Resolve-ParentNode -Nodes $nodes -DistinguishedName $ou.DistinguishedName -Root $root
-        $parent.Children.Add($nodes[$ou.DistinguishedName])
+        $parent.Children += $nodes[$ou.DistinguishedName]
     }
 
     $filter = if ($ServersOnly) { 'OperatingSystem -like "*Server*"' } else { '*' }
@@ -268,7 +273,7 @@ function Get-AdServerTree {
     foreach ($computer in $computers) {
         $parent = Resolve-ParentNode -Nodes $nodes -DistinguishedName $computer.DistinguishedName -Root $root
 
-        $parent.Computers.Add([PSCustomObject]@{
+        $parent.Computers += New-Object -TypeName PSObject -Property @{
             Name            = $computer.Name
             DnsHostName     = $computer.DNSHostName
             OperatingSystem = $computer.OperatingSystem
@@ -276,7 +281,7 @@ function Get-AdServerTree {
             Enabled         = [bool]$computer.Enabled
             Description     = $computer.Description
             LastLogonDate   = $computer.LastLogonDate
-        })
+        }
     }
 
     return $root
@@ -287,6 +292,7 @@ function Get-AdServerTree {
 #region Bygg HTML
 
 function ConvertTo-HtmlText {
+    # Egen HTML-escapning; [System.Net.WebUtility] är inte tillåten i Constrained Language Mode
     param (
         [Parameter()]
         [AllowNull()]
@@ -294,14 +300,12 @@ function ConvertTo-HtmlText {
         [string]$Value
     )
 
-    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+    return ([string]$Value) -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace "'", '&#39;'
 }
 
-function Add-TreeNodeHtml {
+function Get-TreeNodeHtml {
+    # Returnerar HTML-raderna för en nod och allt under den, rekursivt, via pipelinen
     param (
-        [Parameter(Mandatory)]
-        [System.Text.StringBuilder]$Builder,
-
         [Parameter(Mandatory)]
         [object]$Node,
 
@@ -322,24 +326,22 @@ function Add-TreeNodeHtml {
     $openAttr = if ($Open) { ' open' } else { '' }
     $nodePath = if ($Path) { "$Path / $($Node.Name)" } else { $Node.Name }
 
-    [void]$Builder.AppendLine("<details class=""ou""$openAttr>")
-    [void]$Builder.AppendLine(
-        "<summary class=""row"" style=""--depth:$Depth"" title=""$dn"">" +
+    "<details class=""ou""$openAttr>"
+    "<summary class=""row"" style=""--depth:$Depth"" title=""$dn"">" +
         "<span class=""cell name""><span class=""caret""></span>" +
         "<svg class=""ico""><use href=""#$iconId""/></svg>" +
         "<span class=""label"">$name</span><span class=""count"">$count</span></span>" +
         "</summary>"
-    )
-    [void]$Builder.AppendLine("<div class=""children"" style=""--depth:$Depth"">")
+    "<div class=""children"" style=""--depth:$Depth"">"
 
     foreach ($child in ($Node.Children | Sort-Object Name)) {
-        Add-TreeNodeHtml -Builder $Builder -Node $child -Path $nodePath -Depth ($Depth + 1) -Open $Open
+        Get-TreeNodeHtml -Node $child -Path $nodePath -Depth ($Depth + 1) -Open $Open
     }
 
     foreach ($computer in ($Node.Computers | Sort-Object Name)) {
         $rowClass   = if ($computer.Enabled) { 'row server' } else { 'row server disabled' }
         $badge      = if ($computer.Enabled) { '<span class="badge on">Aktiv</span>' } else { '<span class="badge off">Inaktiverad</span>' }
-        $lastLogon  = if ($computer.LastLogonDate) { $computer.LastLogonDate.ToString('yyyy-MM-dd') } else { '&ndash;' }
+        $lastLogon  = if ($computer.LastLogonDate) { Get-Date -Date $computer.LastLogonDate -Format 'yyyy-MM-dd' } else { '&ndash;' }
         $os         = if ($computer.OperatingSystem) { ConvertTo-HtmlText -Value $computer.OperatingSystem } else { '&ndash;' }
         $ip         = if ($computer.IPv4Address) { ConvertTo-HtmlText -Value $computer.IPv4Address } else { '&ndash;' }
         $desc       = ConvertTo-HtmlText -Value $computer.Description
@@ -353,10 +355,9 @@ function Add-TreeNodeHtml {
                 $computer.Description
                 $nodePath
             ) -join ' '
-        ).ToLowerInvariant()
+        ).ToLower()
 
-        [void]$Builder.AppendLine(
-            "<div class=""$rowClass"" style=""--depth:$($Depth + 1)"" data-search=""$searchText"">" +
+        "<div class=""$rowClass"" style=""--depth:$($Depth + 1)"" data-search=""$searchText"">" +
             "<span class=""cell name""><svg class=""ico""><use href=""#i-server""/></svg>" +
             "<span class=""label"" title=""$dnsName"">$(ConvertTo-HtmlText -Value $computer.Name)</span></span>" +
             "<span class=""cell os"">$os</span>" +
@@ -365,16 +366,13 @@ function Add-TreeNodeHtml {
             "<span class=""cell status"">$badge</span>" +
             "<span class=""cell desc"" title=""$desc"">$desc</span>" +
             "</div>"
-        )
     }
 
     if ($Node.Children.Count -eq 0 -and $Node.Computers.Count -eq 0) {
-        [void]$Builder.AppendLine(
-            "<div class=""row empty"" style=""--depth:$($Depth + 1)""><span class=""cell name"">(tomt)</span></div>"
-        )
+        "<div class=""row empty"" style=""--depth:$($Depth + 1)""><span class=""cell name"">(tomt)</span></div>"
     }
 
-    [void]$Builder.AppendLine('</div></details>')
+    '</div></details>'
 }
 
 $style = @'
@@ -568,8 +566,7 @@ $osChips = $allComputers |
 
 $sourceText = if ($Server) { " &middot; K&auml;lla: <code>$(ConvertTo-HtmlText -Value $Server)</code>" } else { '' }
 
-$builder = [System.Text.StringBuilder]::new()
-Add-TreeNodeHtml -Builder $builder -Node $tree -Depth 0 -Open (-not $Collapsed)
+$treeHtml = (Get-TreeNodeHtml -Node $tree -Depth 0 -Open (-not $Collapsed)) -join "`r`n"
 
 $html = @"
 <!DOCTYPE html>
@@ -615,7 +612,7 @@ $($osChips -join "`n")
       <span class="cell">Status</span>
       <span class="cell">Beskrivning</span>
     </div>
-$($builder.ToString())
+$treeHtml
   </div>
 </main>
 <script>
@@ -625,13 +622,14 @@ $script
 </html>
 "@
 
-$fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutFile)
-[System.IO.File]::WriteAllText($fullPath, $html, [System.Text.UTF8Encoding]::new($false))
+# Set-Content i stället för [System.IO.File] så att scriptet fungerar i Constrained Language Mode
+Set-Content -LiteralPath $OutFile -Value $html -Encoding UTF8 -NoNewline
+$fullPath = (Resolve-Path -LiteralPath $OutFile).ProviderPath
 
 Write-Host "Skrev $($allComputers.Count) servrar i $ouCount under-OU:n till $fullPath"
 
 if ($Show) {
-    Invoke-Item -Path $fullPath
+    Invoke-Item -LiteralPath $fullPath
 }
 
 #endregion

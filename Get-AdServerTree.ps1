@@ -10,6 +10,9 @@
     För varje server visas operativsystem, IPv4-adress och om kontot är inaktiverat.
     Datorer som ligger i containrar (CN=...) under OU:t tas också med.
 
+    Scriptet använder bara PowerShell-kärntyper och fungerar därför även i
+    Constrained Language Mode (t.ex. under AppLocker/WDAC).
+
     Kräver modulen ActiveDirectory (RSAT).
 
 .PARAMETER SearchBase
@@ -89,7 +92,7 @@ function Get-RdnValue {
         [string]$DistinguishedName
     )
 
-    $rdn   = [regex]::Match($DistinguishedName, '^(?:[^,\\]|\\.)+').Value
+    $rdn = if ($DistinguishedName -match '^(?:[^,\\]|\\.)+') { $Matches[0] } else { $DistinguishedName }
     $value = $rdn -replace '^[^=]+=', ''
 
     # Ta bort escape-tecken, t.ex. "Test\, Lab" -> "Test, Lab"
@@ -109,12 +112,14 @@ function New-TreeNode {
         [string]$Type
     )
 
-    return [PSCustomObject]@{
+    # New-Object i stället för [PSCustomObject]@{} och vanliga arrayer i stället för List<T>,
+    # eftersom båda de senare stoppas i Constrained Language Mode
+    return New-Object -TypeName PSObject -Property @{
         Name              = $Name
         DistinguishedName = $DistinguishedName
         Type              = $Type
-        Children          = [System.Collections.Generic.List[object]]::new()
-        Computers         = [System.Collections.Generic.List[object]]::new()
+        Children          = @()
+        Computers         = @()
     }
 }
 
@@ -143,7 +148,7 @@ function Resolve-ParentNode {
 
     $rootDn      = $Root.DistinguishedName
     $isBelowRoot = $parentDn.Length -gt $rootDn.Length -and
-        $parentDn.EndsWith(",$rootDn", [StringComparison]::OrdinalIgnoreCase)
+        $parentDn.ToLower().EndsWith(",$rootDn".ToLower())
 
     if (-not $isBelowRoot) {
         # Säkerhetsnät: objekt som inte hör hemma under roten läggs direkt på roten
@@ -156,7 +161,7 @@ function Resolve-ParentNode {
     $Nodes[$parentDn] = $node
 
     $grandParent = Resolve-ParentNode -Nodes $Nodes -DistinguishedName $parentDn -Root $Root
-    $grandParent.Children.Add($node)
+    $grandParent.Children += $node
 
     return $node
 }
@@ -240,7 +245,7 @@ function Get-AdServerTree {
 
     foreach ($ou in $ous) {
         $parent = Resolve-ParentNode -Nodes $nodes -DistinguishedName $ou.DistinguishedName -Root $root
-        $parent.Children.Add($nodes[$ou.DistinguishedName])
+        $parent.Children += $nodes[$ou.DistinguishedName]
     }
 
     $filter = if ($ServersOnly) { 'OperatingSystem -like "*Server*"' } else { '*' }
@@ -257,7 +262,7 @@ function Get-AdServerTree {
     foreach ($computer in $computers) {
         $parent = Resolve-ParentNode -Nodes $nodes -DistinguishedName $computer.DistinguishedName -Root $root
 
-        $parent.Computers.Add([PSCustomObject]@{
+        $parent.Computers += New-Object -TypeName PSObject -Property @{
             Name            = $computer.Name
             DnsHostName     = $computer.DNSHostName
             OperatingSystem = $computer.OperatingSystem
@@ -265,7 +270,7 @@ function Get-AdServerTree {
             Enabled         = [bool]$computer.Enabled
             Description     = $computer.Description
             LastLogonDate   = $computer.LastLogonDate
-        })
+        }
     }
 
     return $root
@@ -275,12 +280,8 @@ function Get-AdServerTree {
 
 #region Rita trädet
 
-function Add-TreeLine {
+function New-TreeLine {
     param (
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [System.Collections.Generic.List[object]]$Lines,
-
         [Parameter(Mandatory)]
         [string]$Text,
 
@@ -288,10 +289,11 @@ function Add-TreeLine {
         [string[]]$Columns
     )
 
-    $Lines.Add([PSCustomObject]@{ Text = $Text; Columns = $Columns })
+    return New-Object -TypeName PSObject -Property @{ Text = $Text; Columns = $Columns }
 }
 
-function Add-TreeNodeLines {
+function Get-TreeNodeLines {
+    # Returnerar en rad per under-OU/server, rekursivt, via pipelinen
     param (
         [Parameter(Mandatory)]
         [object]$Node,
@@ -300,20 +302,16 @@ function Add-TreeNodeLines {
         [string]$Prefix = '',
 
         [Parameter(Mandatory)]
-        [hashtable]$Glyphs,
-
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [System.Collections.Generic.List[object]]$Lines
+        [hashtable]$Glyphs
     )
 
     # Under-OU:n först, sedan datorer - som i dsa.msc
     $items = @(
         foreach ($child in ($Node.Children | Sort-Object Name)) {
-            [PSCustomObject]@{ IsNode = $true; Item = $child }
+            New-Object -TypeName PSObject -Property @{ IsNode = $true; Item = $child }
         }
         foreach ($computer in ($Node.Computers | Sort-Object Name)) {
-            [PSCustomObject]@{ IsNode = $false; Item = $computer }
+            New-Object -TypeName PSObject -Property @{ IsNode = $false; Item = $computer }
         }
     )
 
@@ -325,13 +323,13 @@ function Add-TreeNodeLines {
 
         if ($items[$i].IsNode) {
             $count = @(Get-TreeComputers -Node $item).Count
-            Add-TreeLine -Lines $Lines -Text "$Prefix$connector$($item.Name) ($count)"
-            Add-TreeNodeLines -Node $item -Prefix $nextPrefix -Glyphs $Glyphs -Lines $Lines
+            New-TreeLine -Text "$Prefix$connector$($item.Name) ($count)"
+            Get-TreeNodeLines -Node $item -Prefix $nextPrefix -Glyphs $Glyphs
         }
         else {
             $status = if ($item.Enabled) { '' } else { 'INAKTIVERAD' }
 
-            Add-TreeLine -Lines $Lines -Text "$Prefix$connector$($item.Name)" -Columns @(
+            New-TreeLine -Text "$Prefix$connector$($item.Name)" -Columns @(
                 [string]$item.OperatingSystem
                 [string]$item.IPv4Address
                 $status
@@ -344,15 +342,16 @@ function Format-TreeLines {
     # Justerar kolumnerna så att OS, IP och status hamnar i raka spalter
     param (
         [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [System.Collections.Generic.List[object]]$Lines,
+        [object[]]$Lines,
 
         [Parameter(Mandatory)]
         [string[]]$Headers
     )
 
     $nameWidth = ($Lines | ForEach-Object { $_.Text.Length } | Measure-Object -Maximum).Maximum
-    $nameWidth = [Math]::Max($nameWidth, 'Namn'.Length)
+    if ($nameWidth -lt 'Namn'.Length) {
+        $nameWidth = 'Namn'.Length
+    }
 
     $columnWidths = @(
         for ($c = 0; $c -lt $Headers.Count; $c++) {
@@ -415,9 +414,10 @@ $allComputers  = @(Get-TreeComputers -Node $tree)
 $disabledCount = @($allComputers | Where-Object { -not $_.Enabled }).Count
 $ouCount       = Get-TreeNodeCount -Node $tree
 
-$lines = [System.Collections.Generic.List[object]]::new()
-Add-TreeLine -Lines $lines -Text "$($tree.Name) ($($allComputers.Count))"
-Add-TreeNodeLines -Node $tree -Prefix '' -Glyphs $glyphs -Lines $lines
+$lines = @(
+    New-TreeLine -Text "$($tree.Name) ($($allComputers.Count))"
+    Get-TreeNodeLines -Node $tree -Prefix '' -Glyphs $glyphs
+)
 
 $output = @(
     "Servrar i OU: $($tree.Name)"
