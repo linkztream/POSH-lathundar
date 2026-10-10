@@ -92,6 +92,15 @@ enough to make a helper available – no registration lists.
 - Names: `$script:` for module state; no `$global:`. Private helpers are
   prefixed `Dns` (`Get-DnsZoneTable`), public commands use noun `DnsEntry`,
   `DnsSnapshot`, `DnsZone`, `DnsIssue`, `DnsChange`.
+- **Naming rules (user decision 2026-10-10):** a command or parameter name
+  must say what happens without reading the help, and one concept has one
+  word across the module. The verb carries the effect: `-MarkDhcpRange`
+  marks; a name that implies filtering or removal is wrong for a parameter
+  that only annotates. A parameter shares its word with the property it
+  sets (`-MarkDhcpRange` sets `InDhcpRange`); rename both or neither. Do
+  not import another product's term for a concept the module already
+  names (`ReplicationScope` and zone scope are taken, so DHCP networks are
+  "Range", never "Scope").
 - **No `Write-Host`** outside `Confirm-DnsAction`. `Write-Verbose` for
   diagnostics, `Write-Warning` for degraded-but-continuing, `Write-Progress`
   for anything over a few seconds (throttled, see §15).
@@ -583,7 +592,7 @@ available to compute `Aliases` for a live hit).
 | 8 | `Timestamp` | datetime / $null | $null = static |
 | 9 | `IsStatic` | bool | |
 | 10 | `HasDhcid` | bool / $null | a DHCID record exists at the node; $null when no snapshot was available to tell |
-| 11 | `InDhcpRange` | bool | address matches `-ExcludeNetwork` |
+| 11 | `InDhcpRange` | bool | address matches `-MarkDhcpRange` |
 | 12 | `ReverseZone` | string / $null | expected (longest hosted) reverse zone for `Data`; $null for CNAME or when none |
 | 13 | `PtrTargets` | string[] / $null | targets of PTR records found at the expected node |
 | 14 | `PtrZoneFound` | string / $null | zone where a PTR was actually found (differs from `ReverseZone` when `Shadowed`/`Delegated`) |
@@ -646,7 +655,7 @@ available to compute `Aliases` for a live hit).
 
 ```powershell
 Get-DnsEntry [-Find] <string[]> [-Server <string[]>] [-Zone <string>] [-Exact] [-First <int>]
-             [-ExcludeNetwork <string[]>] [-MaxSnapshotAge <timespan>] [-Credential <pscredential>] [-TimeoutSec <int>]
+             [-MarkDhcpRange <string[]>] [-MaxSnapshotAge <timespan>] [-Credential <pscredential>] [-TimeoutSec <int>]
 ```
 - `-Find`: positional 0, `ValueFromPipeline`, `ValueFromPipelineByPropertyName`,
   `[Alias('Name','Identity','HostName','IPAddress','Address')]`. Each value
@@ -683,7 +692,7 @@ Get-DnsEntry [-Find] <string[]> [-Server <string[]>] [-Zone <string>] [-Exact] [
 - Nothing found for a value → `Write-Warning "No entry matched '<value>' on
   '<server>'."`, no error.
 - Streams output. Uses `Get-DnsZoneTable` once per server.
-- `-ExcludeNetwork` is validated once in `begin {}` (invalid CIDR → one
+- `-MarkDhcpRange` is validated once in `begin {}` (invalid CIDR → one
   warning and the entry is dropped), so `Test-DnsAddressInNetwork` never
   warns per entry.
 

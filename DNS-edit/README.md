@@ -314,9 +314,9 @@ Useful parameters:
   with `-Exact` gives a non-terminating error.
 - `-First <n>` stops after n entries in total, across all values and servers. With
   pipeline input the remaining values are still read, but ignored.
-- `-ExcludeNetwork '10.0.50.0/24', 'fd00::/64'` sets `InDhcpRange` to `$true` for
-  addresses in those networks. Despite its name it removes nothing; filter with
-  `Where-Object { -not $_.InDhcpRange }`.
+- `-MarkDhcpRange '10.0.50.0/24', 'fd00::/64'` marks the entries whose address
+  lies in those networks: `InDhcpRange` becomes `$true`. Nothing is removed;
+  filter with `Where-Object { -not $_.InDhcpRange }`.
 - `-MaxSnapshotAge (New-TimeSpan -Hours 4)` changes the staleness limit of the
   snapshot (default 24 hours): an older snapshot is still used, with a warning.
 - `-Server dc01, dc02` repeats the whole search on every server. Each entry
@@ -798,7 +798,7 @@ the name in every hosted forward zone; with more than 10 zones that is many
 queries. Add `-Zone`.
 
 **Warning "'<entry>' is not a valid network in CIDR notation (for example
-10.0.50.0/24 or fd00::/8); it is ignored."** A `-ExcludeNetwork` entry is
+10.0.50.0/24 or fd00::/8); it is ignored."** A `-MarkDhcpRange` entry is
 misspelled. The other entries are still used.
 
 ### Prompts, language mode and files

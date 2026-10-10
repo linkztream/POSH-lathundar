@@ -4,7 +4,7 @@
         Tests whether an address lies in any of a list of CIDR networks.
 
     .DESCRIPTION
-        Used for -ExcludeNetwork (DHCP ranges): returns $true when the address is in
+        Used for -MarkDhcpRange (DHCP ranges): returns $true when the address is in
         at least one of the networks, otherwise $false. IPv4 and IPv6 are both
         supported; an address is never in a network of the other family.
 

@@ -47,7 +47,7 @@
         The snapshot index used for Aliases, ReferencedBy, HasDhcid and TargetExists.
 
     .PARAMETER Network
-        Validated CIDR networks (Get-DnsEntry -ExcludeNetwork) for InDhcpRange.
+        Validated CIDR networks (Get-DnsEntry -MarkDhcpRange) for InDhcpRange.
 
     .PARAMETER Source
         'Live' or 'Snapshot'.
