@@ -1,94 +1,287 @@
 ﻿function Get-DnsZoneTable {
     <#
-        .SYNOPSIS
-            Hämtar och cachar zontabellen för en DNS-server.
+    .SYNOPSIS
+        Returns the cached table of zones hosted on a DNS server.
 
-        .DESCRIPTION
-            Läser zonerna en gång per server och cachar resultatet i
-            $script:DnsZoneCache (nyckel: servernamn i gemener). Returnerar ett
-            objekt med AllZones, ForwardZones och ReverseZones där de två
-            sistnämnda är strängarrayer med zonnamn.
+    .DESCRIPTION
+        Reads every zone with Get-DnsServerZone, the aging settings of every
+        exportable zone with Get-DnsServerZoneAging, and the server scavenging
+        settings with Get-DnsServerScavenging, and returns one
+        DnsLathund.ZoneTable object (CONTRACTS.md section 8). The table is cached
+        per server in $script:ZoneTableCache for the life of the module; -Refresh
+        reads it again.
 
-            Get-DnsServerZone saknar -Credential. När -Credential anges körs
-            anropet därför via en CIM-session från Get-DnsCimSession; går det
-            inte kastas ett tydligt fel.
+        Each zone becomes a DnsLathund.ZoneInfo object. Reverse zones are detected
+        from IsReverseLookupZone or from the in-addr.arpa / ip6.arpa suffix.
 
-        .EXAMPLE
-            $zones = Get-DnsZoneTable -ComputerName 'dc01'
-            $zones.ReverseZones
+        RFC 2317 classless reverse zones (CONTRACTS.md section 8.3) have a first
+        label '<first>/<n>' or '<first>-<n>':
 
-            Listar reverse-zonerna på dc01.
+          '/' form  n is always a prefix length, 25-32; the zone covers
+                    first ... first + 2^(32-n) - 1 ('0/25' covers 0-127, '5/32'
+                    covers 5 only). Any other n is not classless.
+          '-' form  n of 25-32 is read as a prefix length too (the usual convention
+                    where '/' is avoided: '0-26' covers 0-63, '0-31' covers 0-1).
+                    When n >= first it could also be a last host, so a Verbose
+                    line names both readings. Any other n is the last host octet (range form:
+                    '10-20' covers 10-20, '64-127' covers 64-127).
 
-        .EXAMPLE
-            Get-DnsZoneTable -ComputerName 'dc01' -Force
+        The covered hosts must satisfy first <= last <= 255; otherwise the zone is
+        an ordinary reverse zone (Verbose). Classless zones get IsClassless,
+        ClasslessHostRange (@(first, last)) and ClasslessNetwork: CIDR
+        ('10.0.16.64/26') when the range is a power-of-two block aligned to its
+        size, otherwise the range form ('10.0.16.10-20').
 
-            Läser om zontabellen och förbigår cachen.
+        Failure to list the zones is terminating: nothing else can work. A failed
+        aging query leaves that zone's aging fields $null (Verbose); a failed
+        scavenging query leaves ServerScavenging $null (Warning).
+
+    .PARAMETER Server
+        The DNS server name.
+
+    .PARAMETER Credential
+        Alternate credentials; all DnsServer calls then go through a CIM session.
+
+    .PARAMETER TimeoutSec
+        Timeout for opening the CIM session when -Credential is given.
+
+    .PARAMETER Refresh
+        Ignore the cached table and read the zones again.
+
+    .EXAMPLE
+        $zoneTable = Get-DnsZoneTable -Server 'dc01'
+        $zoneTable.ZoneLookup['contoso.local'].DynamicUpdate
+
+        Returns the dynamic update setting of contoso.local on dc01.
+
+    .EXAMPLE
+        Get-DnsZoneTable -Server 'dc01' -Refresh
+
+        Re-reads the zone list after a zone was created or removed.
     #>
     [CmdletBinding()]
-    [OutputType([PSCustomObject])]
+    [OutputType('DnsLathund.ZoneTable')]
     param (
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string]$ComputerName,
+        [string]$Server,
 
         [Parameter()]
         [AllowNull()]
-        [System.Management.Automation.PSCredential]
-        [System.Management.Automation.Credential()]
-        $Credential,
+        [pscredential]$Credential,
 
         [Parameter()]
-        [switch]$Force
+        [ValidateRange(1, 86400)]
+        [int]$TimeoutSec = 300,
+
+        [Parameter()]
+        [switch]$Refresh
     )
 
-    $cacheKey = $ComputerName.ToLowerInvariant()
-
-    if (-not $Force -and $script:DnsZoneCache.ContainsKey($cacheKey)) {
-        return $script:DnsZoneCache[$cacheKey]
+    $serverKey = $Server.ToLowerInvariant()
+    if (-not $Refresh -and $script:ZoneTableCache.ContainsKey($serverKey)) {
+        Write-Verbose "Using the cached zone table of '$serverKey'."
+        return $script:ZoneTableCache[$serverKey]
     }
 
-    Assert-DnsServerModule
-
-    # Utanför try-blocket med flit: hjälparens fel om en saknad CIM-session är
-    # redan tydligt och ska inte packas om till "Kunde inte läsa DNS-zoner".
-    $serverParameters = Get-DnsServerParameter -ComputerName $ComputerName -Credential $Credential
+    Import-DnsServerModule
+    $serverParameters = Get-DnsServerParameter -Server $serverKey -Credential $Credential -TimeoutSec $TimeoutSec
 
     try {
-        $zones = @(Get-DnsServerZone @serverParameters -ErrorAction Stop)
+        Write-Verbose "Reading the zone list from '$serverKey' (Get-DnsServerZone)."
+        $serverZones = @(Get-DnsServerZone @serverParameters -ErrorAction Stop)
     }
     catch {
-        throw [System.InvalidOperationException]::new(
-            "Kunde inte läsa DNS-zoner från '$ComputerName': $($_.Exception.Message)",
-            $_.Exception
-        )
+        throw "Could not read the zone list from '$serverKey': $($_.Exception.Message) Check the server name, that the DNS Server service is running and that you may read its configuration, or specify another -Server."
     }
 
-    $forwardZones = @(
-        $zones |
-            Where-Object {
-                $_.ZoneName -notlike '*.in-addr.arpa' -and
-                $_.ZoneName -notlike '*.ip6.arpa' -and
-                -not $_.IsReverseLookupZone
-            } |
-            Select-Object -ExpandProperty ZoneName
+    $zoneProperties = @(
+        'ZoneName', 'ZoneType', 'IsReverseLookupZone', 'IsDsIntegrated', 'ReplicationScope',
+        'DirectoryPartitionName', 'DynamicUpdate', 'IsAutoCreated'
     )
+    $agingProperties = @('AgingEnabled', 'NoRefreshInterval', 'RefreshInterval', 'ScavengeServers')
+    $classlessPattern = '^(\d+)([/-])(\d+)\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.in-addr\.arpa$'
 
-    $reverseZones = @(
-        $zones |
-            Where-Object {
-                $_.ZoneName -like '*.in-addr.arpa' -or
-                $_.IsReverseLookupZone
-            } |
-            Select-Object -ExpandProperty ZoneName
-    )
+    $zoneLookup = @{}
+    $zoneInfos = foreach ($serverZone in $serverZones) {
+        if ($null -eq $serverZone) {
+            continue
+        }
 
-    $table = [PSCustomObject]@{
-        AllZones     = $zones
-        ForwardZones = [string[]]$forwardZones
-        ReverseZones = [string[]]$reverseZones
+        # Read optional properties defensively: strict mode throws on a missing one,
+        # and the set differs between zone types and DnsServer versions.
+        $raw = @{}
+        foreach ($propertyName in $zoneProperties) {
+            $property = $serverZone.PSObject.Properties[$propertyName]
+            if ($null -ne $property) {
+                $raw[$propertyName] = $property.Value
+            }
+            else {
+                $raw[$propertyName] = $null
+            }
+        }
+
+        $zoneName = ConvertTo-DnsNormalizedName -Name ([string]$raw['ZoneName'])
+        if (-not $zoneName) {
+            # The root zone '.' normalises to an empty string.
+            $zoneName = '.'
+        }
+
+        $isReverse = ($raw['IsReverseLookupZone'] -eq $true) -or
+            $zoneName.EndsWith('.in-addr.arpa') -or $zoneName.EndsWith('.ip6.arpa')
+        $zoneType = [string]$raw['ZoneType']
+        $isAutoCreated = $raw['IsAutoCreated'] -eq $true
+        $isExportable = ($zoneType -eq 'Primary') -and -not $isAutoCreated -and ($zoneName -ne 'trustanchors')
+
+        $replicationScope = $null
+        if ($null -ne $raw['ReplicationScope'] -and '' -ne [string]$raw['ReplicationScope']) {
+            $replicationScope = [string]$raw['ReplicationScope']
+        }
+        $directoryPartitionName = $null
+        if ($null -ne $raw['DirectoryPartitionName'] -and '' -ne [string]$raw['DirectoryPartitionName']) {
+            $directoryPartitionName = [string]$raw['DirectoryPartitionName']
+        }
+        $dynamicUpdate = $null
+        if ($null -ne $raw['DynamicUpdate']) {
+            $dynamicUpdate = [string]$raw['DynamicUpdate']
+        }
+
+        $aging = @{ AgingEnabled = $null; NoRefreshInterval = $null; RefreshInterval = $null; ScavengeServers = $null }
+        if ($isExportable) {
+            try {
+                Write-Verbose "Reading aging settings of '$zoneName' on '$serverKey' (Get-DnsServerZoneAging)."
+                $zoneAging = Get-DnsServerZoneAging -Name $zoneName @serverParameters -ErrorAction Stop
+                foreach ($propertyName in $agingProperties) {
+                    $property = $zoneAging.PSObject.Properties[$propertyName]
+                    if ($null -ne $property) {
+                        $aging[$propertyName] = $property.Value
+                    }
+                }
+                if ($null -ne $aging['ScavengeServers']) {
+                    $aging['ScavengeServers'] = [string[]]@(
+                        foreach ($scavengeServer in @($aging['ScavengeServers'])) {
+                            if ($null -ne $scavengeServer) {
+                                [string]$scavengeServer
+                            }
+                        }
+                    )
+                }
+            }
+            catch {
+                $aging = @{ AgingEnabled = $null; NoRefreshInterval = $null; RefreshInterval = $null; ScavengeServers = $null }
+                Write-Verbose "Could not read aging settings of '$zoneName' on '$serverKey': $($_.Exception.Message)"
+            }
+        }
+
+        $isClassless = $false
+        $classlessNetwork = $null
+        $classlessHostRange = $null
+        if ($isReverse -and $zoneName -match $classlessPattern) {
+            # -as [int] instead of a cast: an absurdly long digit run must not throw.
+            $firstHost = $Matches[1] -as [int]
+            $separator = $Matches[2]
+            $secondNumber = $Matches[3] -as [int]
+            $octetC = [int]$Matches[4]
+            $octetB = [int]$Matches[5]
+            $octetA = [int]$Matches[6]
+
+            # '/' is always a prefix (25-32); '-' is a prefix for 25-32 by convention, otherwise the last host ('10-20', '64-127').
+            $lastHost = -1
+            $isAmbiguous = $false
+            if ($null -ne $firstHost -and $null -ne $secondNumber) {
+                if ($secondNumber -ge 25 -and $secondNumber -le 32) {
+                    $lastHost = $firstHost + (1 -shl (32 - $secondNumber)) - 1
+                    # Only a real ambiguity when the range reading would be valid too ('0-31' yes, '64-26' no).
+                    $isAmbiguous = ($separator -eq '-') -and ($secondNumber -ge $firstHost)
+                }
+                elseif ($separator -eq '-') {
+                    $lastHost = $secondNumber
+                }
+            }
+
+            if ($lastHost -ge $firstHost -and $lastHost -le 255 -and $octetA -le 255 -and $octetB -le 255 -and $octetC -le 255) {
+                $isClassless = $true
+                if ($isAmbiguous) {
+                    Write-Verbose ("Zone '{0}': '{1}-{2}' was read as prefix /{2} (hosts {1}-{3}); it could also mean the host range {1}-{2}." -f $zoneName, $firstHost, $secondNumber, $lastHost)
+                }
+                $classlessHostRange = @($firstHost, $lastHost)
+                $classlessNetwork = '{0}.{1}.{2}.{3}-{4}' -f $octetA, $octetB, $octetC, $firstHost, $lastHost
+
+                # CIDR only for a power-of-two block aligned to its size; any other range keeps the range form.
+                $rangeSize = $lastHost - $firstHost + 1
+                for ($prefixLength = 32; $prefixLength -ge 24; $prefixLength--) {
+                    if ((1 -shl (32 - $prefixLength)) -eq $rangeSize -and ($firstHost % $rangeSize) -eq 0) {
+                        $classlessNetwork = '{0}.{1}.{2}.{3}/{4}' -f $octetA, $octetB, $octetC, $firstHost, $prefixLength
+                        break
+                    }
+                }
+            }
+            if (-not $isClassless) {
+                Write-Verbose "Zone '$zoneName' looks like an RFC 2317 zone but its range is not valid; treated as an ordinary reverse zone."
+            }
+        }
+
+        $zoneInfo = New-DnsObject -TypeName 'ZoneInfo' -Property ([ordered]@{
+                ZoneName               = $zoneName
+                IsReverse              = $isReverse
+                ZoneType               = $zoneType
+                IsDsIntegrated         = $raw['IsDsIntegrated'] -eq $true
+                ReplicationScope       = $replicationScope
+                DirectoryPartitionName = $directoryPartitionName
+                DynamicUpdate          = $dynamicUpdate
+                IsAutoCreated          = $isAutoCreated
+                IsReadOnly             = ($zoneType -ne 'Primary') -or $isAutoCreated
+                IsExportable           = $isExportable
+                AgingEnabled           = $aging['AgingEnabled']
+                NoRefreshInterval      = $aging['NoRefreshInterval']
+                RefreshInterval        = $aging['RefreshInterval']
+                ScavengeServers        = $aging['ScavengeServers']
+                IsClassless            = $isClassless
+                ClasslessNetwork       = $classlessNetwork
+                ClasslessHostRange     = $classlessHostRange
+            })
+
+        $zoneLookup[$zoneName] = $zoneInfo
+        $zoneInfo
+    }
+    $zoneInfos = @($zoneInfos)
+
+    $forwardZones = [string[]]@(foreach ($zoneInfo in $zoneInfos) { if (-not $zoneInfo.IsReverse) { $zoneInfo.ZoneName } })
+    $reverseZones = [string[]]@(foreach ($zoneInfo in $zoneInfos) { if ($zoneInfo.IsReverse) { $zoneInfo.ZoneName } })
+    $classlessZones = @(foreach ($zoneInfo in $zoneInfos) { if ($zoneInfo.IsClassless) { $zoneInfo } })
+
+    $serverScavenging = $null
+    try {
+        Write-Verbose "Reading scavenging settings of '$serverKey' (Get-DnsServerScavenging)."
+        $scavenging = Get-DnsServerScavenging @serverParameters -ErrorAction Stop
+        $scavengingValues = @{ ScavengingState = $null; ScavengingInterval = $null; LastScavengeTime = $null }
+        foreach ($propertyName in @('ScavengingState', 'ScavengingInterval', 'LastScavengeTime')) {
+            $property = $scavenging.PSObject.Properties[$propertyName]
+            if ($null -ne $property) {
+                $scavengingValues[$propertyName] = $property.Value
+            }
+        }
+        $serverScavenging = New-DnsObject -TypeName 'ServerScavenging' -Property ([ordered]@{
+                ScavengingState    = $scavengingValues['ScavengingState']
+                ScavengingInterval = $scavengingValues['ScavengingInterval']
+                LastScavengeTime   = $scavengingValues['LastScavengeTime']
+            })
+    }
+    catch {
+        Write-Warning "Could not read the scavenging settings of '$serverKey': $($_.Exception.Message) ServerScavenging is left empty."
     }
 
-    $script:DnsZoneCache[$cacheKey] = $table
+    $zoneTable = New-DnsObject -TypeName 'ZoneTable' -Property ([ordered]@{
+            Server           = $serverKey
+            RetrievedAt      = Get-Date
+            Zones            = $zoneInfos
+            ZoneLookup       = $zoneLookup
+            ForwardZones     = $forwardZones
+            ReverseZones     = $reverseZones
+            ClasslessZones   = $classlessZones
+            ServerScavenging = $serverScavenging
+        })
 
-    return $table
+    $script:ZoneTableCache[$serverKey] = $zoneTable
+    $zoneTable
 }

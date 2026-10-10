@@ -1,32 +1,84 @@
 ﻿function Export-DnsZoneFile {
     <#
-        .SYNOPSIS
-            Exporterar en DNS-zon till en lokal textfil (BIND-format).
+    .SYNOPSIS
+        Exports one DNS zone on the server and copies the export file here.
 
-        .DESCRIPTION
-            Kör Export-DnsServerZone på servern med ett tidsstämplat filnamn
-            (cmdleten vägrar skriva över befintlig fil), hämtar filen lokalt
-            (lokal sökväg -> UNC \\server\admin$\System32\dns\ -> Invoke-Command)
-            till "$env:TEMP\DnsLathund\" och städar serverfilen i ett finally-block.
+    .DESCRIPTION
+        Runs Export-DnsServerZone on the DNS server, which always writes into
+        %windir%\System32\dns on the server, then retrieves that file to
+        -DestinationPath and removes the server copy (CONTRACTS.md section 9.1).
+        Returns the full local path.
 
-            Serverfilen hamnar alltid i %windir%\System32\dns på DNS-servern.
-            Misslyckas städningen skrivs en varning med serverns sökväg —
-            funktionen kastar aldrig på grund av en misslyckad städning.
+        The server-side file name is unique per call,
+        dnslathund_<zone>_<yyyyMMddHHmmssfff>.txt (characters outside
+        A-Z, a-z, 0-9, '.', '_' and '-' in the zone name become '_'), because
+        Export-DnsServerZone refuses to overwrite and two operators may export
+        the same zone at the same time.
 
-            Den lokala kopian tas INTE bort här; det ansvaret ligger på
-            anroparen (normalt ett finally-block i Get-DnsOrphanPtr).
+        Retrieval, in this order:
+        1. The server is this computer (-Server equals COMPUTERNAME, its DNS
+           host name or FQDN, 'localhost', '.', '127.0.0.1' or '::1'): copy from
+           the local export folder ($script:DnsServerExportRoot). Nothing else is
+           tried, because the other paths would only reach the same folder.
+        2. Otherwise, without -Credential: copy from
+           \\<server>\admin$\System32\dns\<file>. Skipped with -Credential,
+           because a UNC copy cannot carry alternate credentials.
+        3. Otherwise, or when the UNC copy fails: Invoke-Command (with
+           -Credential when given) reads the file with Get-Content -ReadCount 2000
+           on the server and the chunks are appended locally with Add-Content as
+           they arrive, so a 550 000-line zone never travels as one string.
 
-            Returnerar sökvägen till den lokala kopian.
+        The server copy is removed in a finally block, also when the retrieval
+        fails, unless -KeepRemoteFile is set. A failed removal is a warning that
+        names the exact remote path, not an error: the local copy is good.
 
-        .EXAMPLE
-            Export-DnsZoneFile -ZoneName 'contoso.local' -ComputerName 'dc01'
+        Every file write carries -WhatIf:$false -Confirm:$false, so a caller's
+        -WhatIf cannot leave a half-made snapshot behind; the caller decides
+        whether to export at all before calling this function.
 
-            Exporterar zonen och returnerar sökvägen till den lokala kopian.
+        Throws when the zone cannot be exported (for example when it does not
+        exist, is not a primary zone, or access is denied), when the file cannot
+        be retrieved by any method, or when -DestinationPath already exists.
 
-        .EXAMPLE
-            Export-DnsZoneFile -ZoneName 'contoso.local' -ComputerName 'dc01' -KeepRemoteFile
+    .PARAMETER ZoneName
+        The zone to export.
 
-            Behåller exportfilen på servern för felsökning.
+    .PARAMETER Server
+        The DNS server that hosts the zone.
+
+    .PARAMETER DestinationPath
+        Full path of the local file to create. It must not exist; its folder is
+        created when missing.
+
+    .PARAMETER Credential
+        Alternate credentials. The export then runs through a CIM session
+        (Get-DnsServerParameter), the UNC copy is skipped and Invoke-Command uses
+        the credentials.
+
+    .PARAMETER TimeoutSec
+        Timeout for the CIM session, for opening the remoting session and for
+        each remoting operation.
+
+    .PARAMETER KeepRemoteFile
+        Leave the export file on the server (for troubleshooting).
+
+    .EXAMPLE
+        Export-DnsZoneFile -ZoneName 'contoso.local' -Server 'dc01' -DestinationPath 'C:\Temp\contoso.local.txt'
+
+        Exports contoso.local on dc01, copies it to C:\Temp and removes the copy
+        on dc01. Returns 'C:\Temp\contoso.local.txt'.
+
+    .EXAMPLE
+        Export-DnsZoneFile -ZoneName '16.0.10.in-addr.arpa' -Server 'dc01' -DestinationPath $path -Credential $cred
+
+        Exports through a CIM session as $cred and streams the file back over
+        WinRM as $cred.
+
+    .NOTES
+        Windows PowerShell 5.1 writes a UTF-8 BOM when Add-Content -Encoding UTF8
+        creates the local file (WinRM path only; the local and UNC paths copy the
+        bytes unchanged). A real export has no BOM. The zone file parser sniffs
+        the BOM, so both forms read the same.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -37,193 +89,207 @@
 
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string]$ComputerName,
+        [string]$Server,
 
-        # Katalog dit den lokala kopian skrivs. Standard: $env:TEMP\DnsLathund.
-        [Parameter()]
+        [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
         [string]$DestinationPath,
 
         [Parameter()]
         [AllowNull()]
-        [System.Management.Automation.PSCredential]
-        [System.Management.Automation.Credential()]
-        $Credential,
+        [pscredential]$Credential,
+
+        [Parameter()]
+        [ValidateRange(1, 86400)]
+        [int]$TimeoutSec = 300,
 
         [Parameter()]
         [switch]$KeepRemoteFile
     )
 
-    Assert-DnsServerModule
+    $serverKey = $Server.Trim().ToLowerInvariant()
+    $zone = $ZoneName.Trim().TrimEnd('.')
+    $hasCredential = ($null -ne $Credential) -and ('' -ne [string]$Credential.UserName)
 
-    # Zonnamn kan innehålla tecken som inte duger i filnamn (klasslösa
-    # reverse-zoner har snedstreck). Tidsstämpeln gör namnet unikt eftersom
-    # Export-DnsServerZone vägrar skriva över en befintlig fil.
-    $safeZoneName = [regex]::Replace($ZoneName, '[^A-Za-z0-9._-]', '_')
-
-    $exportFileName = 'dnslathund_{0}_{1}.txt' -f $safeZoneName, (Get-Date -Format 'yyyyMMddHHmmss')
-
-    $isLocalComputer = $false
-
-    foreach ($localAlias in @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')) {
-        if (
-            -not [string]::IsNullOrEmpty($localAlias) -and
-            [string]::Equals($localAlias, $ComputerName, [System.StringComparison]::OrdinalIgnoreCase)
-        ) {
-            $isLocalComputer = $true
-            break
-        }
+    # Refusing before anything runs on the server keeps an existing snapshot file
+    # safe from a wrong argument.
+    if (Test-Path -LiteralPath $DestinationPath) {
+        throw "The destination file '$DestinationPath' already exists and is never overwritten. Remove it or specify another -DestinationPath."
+    }
+    $destinationFolder = Split-Path -Path $DestinationPath -Parent
+    if ($destinationFolder -and -not (Test-Path -LiteralPath $destinationFolder -PathType Container)) {
+        $null = New-Item -Path $destinationFolder -ItemType Directory -Force -ErrorAction Stop -WhatIf:$false -Confirm:$false
     }
 
-    $localServerPath = Join-Path -Path (Join-Path -Path $env:windir -ChildPath 'System32\dns') -ChildPath $exportFileName
-    $uncServerPath = '\\{0}\admin$\System32\dns\{1}' -f $ComputerName, $exportFileName
-
-    # Sökvägen så som den ser ut PÅ servern — används i Invoke-Command och i
-    # varningstexten när städningen misslyckas.
-    $remoteServerPath = 'System32\dns\{0}' -f $exportFileName
-
-    # Utanför try-blocket med flit: hjälparens fel om en saknad CIM-session är
-    # redan tydligt och ska inte packas om till "Kunde inte exportera zonen".
-    $serverParameters = Get-DnsServerParameter -ComputerName $ComputerName -Credential $Credential
-
+    # --- Is the server this computer? ---
+    $localNames = @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1', '::1')
     try {
-        Export-DnsServerZone -Name $ZoneName -FileName $exportFileName @serverParameters -ErrorAction Stop
-    }
-    catch {
-        throw [System.InvalidOperationException]::new(
-            "Kunde inte exportera zonen '$ZoneName' på '$ComputerName': $($_.Exception.Message)",
-            $_.Exception
+        # COMPUTERNAME is the NetBIOS name (15 characters at most); the DNS host
+        # name and the primary DNS suffix live in the TCP/IP parameters.
+        $tcpip = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -ErrorAction Stop
+        $hostName = ''
+        $domainName = ''
+        if ($null -ne $tcpip.PSObject.Properties['Hostname']) {
+            $hostName = [string]$tcpip.Hostname
+        }
+        if ($null -ne $tcpip.PSObject.Properties['Domain']) {
+            $domainName = [string]$tcpip.Domain
+        }
+        $localNames = $localNames + @(
+            $hostName
+            if ($domainName) {
+                "$($env:COMPUTERNAME).$domainName"
+                if ($hostName) {
+                    "$hostName.$domainName"
+                }
+            }
         )
     }
+    catch {
+        Write-Verbose "Could not read the DNS host name of this computer: $($_.Exception.Message)"
+    }
+    $isLocal = $localNames -contains $serverKey
 
-    # Metoden som lyckades med hämtningen återanvänds vid städningen.
-    $retrievalMethod = $null
+    $safeZone = $zone -replace '[^A-Za-z0-9._-]', '_'
+    $remoteFileName = 'dnslathund_{0}_{1}.txt' -f $safeZone, (Get-Date -Format 'yyyyMMddHHmmssfff')
+    $localSource = Join-Path -Path $script:DnsServerExportRoot -ChildPath $remoteFileName
+    $uncPath = '\\{0}\admin$\System32\dns\{1}' -f $serverKey, $remoteFileName
+    if ($isLocal) {
+        $remoteDisplayPath = "'$localSource'"
+    }
+    else {
+        $remoteDisplayPath = "'%windir%\System32\dns\$remoteFileName' on '$serverKey' ($uncPath)"
+    }
 
+    $invokeParameters = @{
+        ComputerName  = $serverKey
+        SessionOption = New-PSSessionOption -OpenTimeout ($TimeoutSec * 1000) -OperationTimeout ($TimeoutSec * 1000)
+        ErrorAction   = 'Stop'
+    }
+    if ($hasCredential) {
+        $invokeParameters['Credential'] = $Credential
+    }
+
+    # --- Export on the server ---
+    Import-DnsServerModule
+    $serverParameters = Get-DnsServerParameter -Server $serverKey -Credential $Credential -TimeoutSec $TimeoutSec
     try {
-        $destinationDirectory = $DestinationPath
+        Write-Verbose "Exporting zone '$zone' on '$serverKey' to $remoteDisplayPath (Export-DnsServerZone)."
+        $null = Export-DnsServerZone -Name $zone -FileName $remoteFileName @serverParameters -ErrorAction Stop -WhatIf:$false -Confirm:$false
+    }
+    catch {
+        throw "Could not export zone '$zone' on '$serverKey': $($_.Exception.Message) Check that the zone exists on that server, that it is a primary zone, and that your account may export it (DnsAdmins or Administrators)."
+    }
 
-        if ([string]::IsNullOrWhiteSpace($destinationDirectory)) {
-            $destinationDirectory = Join-Path -Path $env:TEMP -ChildPath 'DnsLathund'
-        }
-
-        if (-not (Test-Path -LiteralPath $destinationDirectory)) {
-            $null = New-Item -Path $destinationDirectory -ItemType Directory -Force -ErrorAction Stop
-        }
-
-        $localCopyPath = Join-Path -Path $destinationDirectory -ChildPath $exportFileName
-
-        $retrievalErrors = New-Object System.Collections.Generic.List[string]
-
-        # (a) Lokal maskin — läs direkt ur %windir%\System32\dns.
-        if ($isLocalComputer) {
+    # --- Retrieve, then always clean up the server copy ---
+    $retrievedBy = ''
+    $failures = @{}
+    try {
+        if ($isLocal) {
             try {
-                Copy-Item -LiteralPath $localServerPath -Destination $localCopyPath -Force -ErrorAction Stop
-
-                $retrievalMethod = 'Local'
+                Write-Verbose "Copying '$localSource' to '$DestinationPath' (the DNS server is this computer)."
+                Copy-Item -LiteralPath $localSource -Destination $DestinationPath -ErrorAction Stop -WhatIf:$false -Confirm:$false
+                $retrievedBy = 'Local'
             }
             catch {
-                $retrievalErrors.Add("lokal sökväg: $($_.Exception.Message)")
+                $failures['Local copy'] = $_.Exception.Message
             }
         }
-
-        # (b) UNC mot administrativ utdelning.
-        if ($null -eq $retrievalMethod) {
-            try {
-                Copy-Item -LiteralPath $uncServerPath -Destination $localCopyPath -Force -ErrorAction Stop
-
-                $retrievalMethod = 'Unc'
+        else {
+            if ($hasCredential) {
+                Write-Verbose "Skipping the copy from '$uncPath': a UNC copy cannot use -Credential."
             }
-            catch {
-                $retrievalErrors.Add("UNC: $($_.Exception.Message)")
+            else {
+                try {
+                    Write-Verbose "Copying '$uncPath' to '$DestinationPath'."
+                    Copy-Item -LiteralPath $uncPath -Destination $DestinationPath -ErrorAction Stop -WhatIf:$false -Confirm:$false
+                    $retrievedBy = 'Unc'
+                }
+                catch {
+                    $failures['admin$ share'] = $_.Exception.Message
+                }
             }
-        }
 
-        # (c) Fjärranrop — läs filens innehåll över WinRM.
-        if ($null -eq $retrievalMethod) {
-            try {
-                $invokeParameters = @{
-                    ComputerName = $ComputerName
-                    ScriptBlock  = {
-                        [System.IO.File]::ReadAllText(
-                            (Join-Path -Path $env:windir -ChildPath $using:remoteServerPath)
-                        )
+            if (-not $retrievedBy) {
+                # A failed copy may have left a partial file behind.
+                if (Test-Path -LiteralPath $DestinationPath) {
+                    Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
+                }
+                try {
+                    Write-Verbose "Streaming '$remoteFileName' from '$serverKey' over WinRM (Invoke-Command, 2000 lines per chunk) to '$DestinationPath'."
+                    # Each chunk is a string[] of up to 2000 lines that Add-Content appends
+                    # as it arrives, so memory stays flat whatever the zone size.
+                    Invoke-Command @invokeParameters -ScriptBlock {
+                        Get-Content -LiteralPath (Join-Path -Path $env:windir -ChildPath ('System32\dns\' + $using:remoteFileName)) -ReadCount 2000 -Encoding UTF8 -ErrorAction Stop
+                    } | Add-Content -LiteralPath $DestinationPath -Encoding UTF8 -ErrorAction Stop -WhatIf:$false -Confirm:$false
+
+                    if (-not (Test-Path -LiteralPath $DestinationPath -PathType Leaf)) {
+                        throw 'The server returned no content.'
                     }
-                    ErrorAction  = 'Stop'
+                    $retrievedBy = 'WinRM'
                 }
-
-                if ($null -ne $Credential) {
-                    $invokeParameters['Credential'] = $Credential
+                catch {
+                    $failures['WinRM'] = $_.Exception.Message
                 }
-
-                $content = Invoke-Command @invokeParameters
-
-                [System.IO.File]::WriteAllText(
-                    $localCopyPath,
-                    [string]$content,
-                    (New-Object System.Text.UTF8Encoding($false))
-                )
-
-                $retrievalMethod = 'Remote'
-            }
-            catch {
-                $retrievalErrors.Add("Invoke-Command: $($_.Exception.Message)")
             }
         }
 
-        if ($null -eq $retrievalMethod) {
-            throw "Kunde inte hämta exportfilen '$exportFileName' från '$ComputerName'. Försök: $($retrievalErrors -join ' | ')"
+        if (-not $retrievedBy) {
+            if (Test-Path -LiteralPath $DestinationPath) {
+                Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
+            }
+            $reasons = @(foreach ($method in @($failures.Keys | Sort-Object)) { "[$method] $($failures[$method])" }) -join ' '
+            throw "Zone '$zone' was exported on '$serverKey' but the file $remoteDisplayPath could not be copied here. $reasons Check that this computer can reach the admin`$ share or WinRM on '$serverKey'."
         }
 
-        Write-Verbose "Zonen '$ZoneName' exporterades från '$ComputerName' (hämtningsmetod: $retrievalMethod) till '$localCopyPath'."
-
-        return $localCopyPath
+        Write-Verbose "Retrieved zone '$zone' from '$serverKey' ($retrievedBy) to '$DestinationPath'."
     }
     finally {
         if ($KeepRemoteFile) {
-            Write-Verbose "Behåller serverfilen '$remoteServerPath' på '$ComputerName' (-KeepRemoteFile)."
+            Write-Verbose "Keeping the export file $remoteDisplayPath (-KeepRemoteFile)."
         }
         else {
-            # Städningen får aldrig avbryta flödet: en kvarlämnad exportfil är
-            # ett städproblem, inte ett fel i uppslaget.
-            try {
-                switch ($retrievalMethod) {
-                    'Local' {
-                        Remove-Item -LiteralPath $localServerPath -Force -ErrorAction Stop
-                    }
-                    'Remote' {
-                        $removeParameters = @{
-                            ComputerName = $ComputerName
-                            ScriptBlock  = {
-                                Remove-Item -LiteralPath (
-                                    Join-Path -Path $env:windir -ChildPath $using:remoteServerPath
-                                ) -Force -ErrorAction Stop
-                            }
-                            ErrorAction  = 'Stop'
-                        }
+            # The way that already worked comes first; WinRM is the fallback for UNC.
+            if ($isLocal) {
+                $cleanupMethods = @('Local')
+            }
+            elseif ($hasCredential -or $retrievedBy -eq 'WinRM') {
+                $cleanupMethods = @('WinRM')
+            }
+            else {
+                $cleanupMethods = @('Unc', 'WinRM')
+            }
 
-                        if ($null -ne $Credential) {
-                            $removeParameters['Credential'] = $Credential
+            $removed = $false
+            $cleanupFailures = foreach ($cleanupMethod in $cleanupMethods) {
+                try {
+                    if ($cleanupMethod -eq 'Local') {
+                        Write-Verbose "Removing '$localSource'."
+                        Remove-Item -LiteralPath $localSource -Force -ErrorAction Stop -WhatIf:$false -Confirm:$false
+                    }
+                    elseif ($cleanupMethod -eq 'Unc') {
+                        Write-Verbose "Removing '$uncPath'."
+                        Remove-Item -LiteralPath $uncPath -Force -ErrorAction Stop -WhatIf:$false -Confirm:$false
+                    }
+                    else {
+                        Write-Verbose "Removing '$remoteFileName' on '$serverKey' over WinRM (Invoke-Command)."
+                        $null = Invoke-Command @invokeParameters -ScriptBlock {
+                            Remove-Item -LiteralPath (Join-Path -Path $env:windir -ChildPath ('System32\dns\' + $using:remoteFileName)) -Force -ErrorAction Stop -WhatIf:$false -Confirm:$false
                         }
-
-                        Invoke-Command @removeParameters
                     }
-                    default {
-                        # Både 'Unc' och misslyckad hämtning städas via UNC —
-                        # filen kan ha skapats även om hämtningen sedan sprack.
-                        Remove-Item -LiteralPath $uncServerPath -Force -ErrorAction Stop
-                    }
+                    $removed = $true
+                    break
+                }
+                catch {
+                    "[$cleanupMethod] $($_.Exception.Message)"
                 }
             }
-            catch {
-                $serverPathForWarning = if ($isLocalComputer -and $retrievalMethod -eq 'Local') {
-                    $localServerPath
-                }
-                else {
-                    $uncServerPath
-                }
 
-                Write-Warning "Kunde inte ta bort exportfilen på servern: '$serverPathForWarning'. Ta bort den manuellt. ($($_.Exception.Message))"
+            if (-not $removed) {
+                Write-Warning "Could not remove the export file $remoteDisplayPath from the DNS server: $(@($cleanupFailures) -join ' ') Delete it manually."
             }
         }
     }
+
+    Convert-Path -LiteralPath $DestinationPath
 }

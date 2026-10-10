@@ -1,0 +1,462 @@
+﻿TOPIC
+    about_DnsLathund
+
+SHORT DESCRIPTION
+    Explains how DnsLathund finds and checks DNS records in very large zones:
+    snapshots, PTR status, the confirmation gate, the change log, the
+    automation contract and Constrained Language Mode.
+
+LONG DESCRIPTION
+    DnsLathund is a PowerShell module for finding, auditing and, in later
+    phases, repairing, creating and removing A, AAAA, PTR and CNAME records in
+    large, messy Microsoft DNS (Active Directory-integrated) environments.
+    This topic explains the ideas behind the commands. For the syntax and
+    examples of one command, use Get-Help <command> -Full.
+
+    WHAT IS NEW IN THIS VERSION
+
+        This version is phase 1 of the plan: the foundation and the read-only
+        commands. It has three commands and changes nothing in DNS.
+
+        Get-DnsEntry
+            Finds A, AAAA and CNAME records by name, address or pattern and
+            reports the PTR status of each. It returns one DnsLathund.Entry
+            object per record.
+
+        Get-DnsSnapshot
+            Lists the zones in the local snapshot with their export time and
+            age. It contacts no server.
+
+        Update-DnsSnapshot
+            Exports zones from a DNS server into the local snapshot and
+            rebuilds the search index. It writes local files only.
+
+        The commands that change records (Remove-DnsEntry, New-DnsEntry,
+        Set-DnsEntry, Repair-DnsIssue) and the consistency audit
+        (Test-DnsConsistency) are planned for later phases. Where this topic
+        describes how change commands behave (the confirmation gate, the
+        change log, Result objects), that is how they are planned to behave
+        and the text says so. No command in this version writes to the
+        change log.
+
+    WHY THE TOOL EXISTS
+
+        The environment the module was built for has about 44 domain
+        controllers running DNS and one zone with more than 550,000 records.
+        DNS Manager times out there, and so does an unfiltered
+        Get-DnsServerResourceRecord -ZoneName <zone>. DnsLathund therefore
+        never enumerates a whole zone from the server. Anything that needs the
+        whole zone reads a cached export of that zone (a snapshot). A live
+        query is made only for a single node.
+
+        The second problem is PTR drift. Over the years address records and
+        reverse (PTR) records get out of step: hosts are removed and their PTR
+        records stay, addresses are reused, reverse zones are added after the
+        PTR records already exist in a parent zone, and classless delegations
+        hide records. DnsLathund compares every A and AAAA record with the
+        reverse records and reports the result in the PtrStatus property.
+
+    SNAPSHOT AND LIVE DATA
+
+        A snapshot is a text export of a zone, made with Export-DnsServerZone
+        on the DNS server and copied to the local computer. The server writes
+        the export into %windir%\System32\dns; Update-DnsSnapshot copies it
+        (from the local folder if the server is this computer, otherwise
+        through the admin$ share unless -Credential is used, otherwise
+        through WinRM) and deletes the server copy again.
+        Update-DnsSnapshot creates and refreshes the snapshot.
+        Get-DnsSnapshot lists it without contacting any server.
+
+        Where it is stored: %LOCALAPPDATA%\DnsLathund\snapshot, or the folder
+        named by the environment variable DNSLATHUND_SNAPSHOTPATH when that is
+        set. Below that folder there is one folder per server, named after
+        the -Server value in lower case, so dc01 and dc01.contoso.local are
+        two separate snapshots:
+
+            <snapshot folder>\dc01\meta.json
+            <snapshot folder>\dc01\contoso.local.txt
+            <snapshot folder>\dc01\16.0.10.in-addr.arpa.txt
+
+        meta.json records when each zone was exported and the zone settings
+        at that time. Each zone is one .txt file in the format of
+        Export-DnsServerZone; characters outside A-Z, a-z, 0-9, '.', '_' and
+        '-' in the zone name become '_' in the file name. A new file replaces
+        the old one only after its export succeeded. By default the snapshot
+        lives in the profile of the Windows account that made it. Because the
+        files are plain copies of your zones, protect the folder as you
+        protect the zones.
+
+        Get-DnsEntry decides per -Find value how to look:
+
+        - A pattern (contains * or ?) and a bare name without -Zone or -Exact
+          (a substring search) read the snapshot and need one. If the server
+          has none, the zones are exported first, after a warning.
+        - An address, a full name (FQDN) and a bare name with -Zone or -Exact
+          are read live from the server (Source = Live). A snapshot is used
+          only to fill in extra properties and, for an address, to find more
+          names that have the address; these lookups never create one.
+
+        The properties SharedWith, Aliases, ReferencedBy, HasDhcid and
+        TargetExists come from the snapshot. A live entry fills them from the
+        snapshot, if one exists, of any age. If none exists, they are null,
+        which means "not evaluated". An empty list means "evaluated, nothing
+        found".
+
+        SnapshotAge is the age of the oldest zone export that was used to fill
+        the snapshot-derived properties of that entry. It is null when no
+        snapshot was used. A SnapshotAge of 30 minutes means every zone behind
+        the entry was exported within the last 30 minutes. A SnapshotAge of 3
+        days means at least one was exported 3 days ago, and anything that
+        changed since then is not in the answer.
+
+        A snapshot older than 24 hours (change this with -MaxSnapshotAge on
+        Get-DnsEntry) is still used, with a warning that names its age and
+        Update-DnsSnapshot. The warning also appears when a live lookup uses
+        an old snapshot for the extra properties. DnsLathund never refreshes
+        an existing snapshot by itself; only when no snapshot exists at all
+        does the first command that needs one export the zones, after a
+        warning that this can take several minutes on large zones.
+
+        The search index is built from the snapshot files and kept in memory
+        for the PowerShell session. Update-DnsSnapshot rebuilds it; in a new
+        session the first snapshot search reads the files again.
+
+        Commands that change DNS (planned) will read the record live
+        immediately before acting. A snapshot will never be the basis for a
+        change.
+
+    PTR STATUS VALUES
+
+        PtrStatus is set on every A and AAAA entry. The expected reverse zone
+        is the longest hosted reverse zone that covers the address; a
+        classless (RFC 2317) zone counts as longer than its parent. Stub and
+        conditional forwarder zones hold no records on this server and do not
+        count. The expected node in that zone is examined first, then shorter
+        covering zones.
+
+        Ok
+            Cause: a PTR exists at the expected node and points at this name,
+            or at another name that has an A or AAAA record with the same
+            address (see SharedWith).
+            Action: none.
+
+        Missing
+            Cause: a reverse zone covers the address, but no covering zone
+            holds a PTR for it. Typical reasons: the host never registered
+            one, the reverse zone does not accept dynamic updates, or the PTR
+            was scavenged or deleted.
+            Action: if the A or AAAA record is static, create the PTR
+            (Repair-DnsIssue, planned for a later phase; until then in DNS
+            Manager or with the DnsServer cmdlets). If the record is dynamic,
+            do not create the PTR by hand; find out why the client or the DHCP
+            server does not register it. DnsLathund will never create a PTR
+            for a dynamic record.
+
+        WrongTarget
+            Cause: a PTR exists at the expected node but points at no name
+            that has an A or AAAA record with this address. A typical reason
+            is that the address was reused and the previous host's PTR stayed.
+            PtrTargets lists what the PTR points at.
+            Action: decide which name owns the address. Correct the PTR so it
+            points at the owner, or remove it. SharedWith lists the other
+            names that have this address.
+
+        Shadowed
+            Cause: the expected (most specific) reverse zone has no PTR for
+            the node, but a shorter covering zone does. Clients ask the most
+            specific zone, so they never see it. PtrZoneFound names the zone
+            that holds it. A typical reason: a /24 reverse zone was created
+            after the PTR records already lived in the /16 zone.
+            Action: create the PTR in the zone named by ReverseZone and remove
+            the stray one in the zone named by PtrZoneFound.
+
+        Delegated
+            Cause: the expected node is handed on to someone else. Either it
+            is a CNAME into a classless (RFC 2317) zone, so the PTR is meant
+            to live there, and PtrZoneFound names that zone when it is hosted
+            on this server and is null otherwise. Or an NS delegation at or
+            above the node points it at another server; PtrZoneFound is null.
+            Action: normally none. If PtrZoneFound is null for a CNAME, check
+            the classless zone on the server that hosts it. DnsLathund detects
+            and classifies these zones but does not repair them.
+
+        Multiple
+            Cause: more than one PTR exists at the expected node and at least
+            one of them matches (see Ok). Resolvers receive the records in
+            rotation, so reverse lookups return different names.
+            Action: keep the PTR you want and remove the others. PtrTargets
+            lists all of them.
+
+        NoReverseZone
+            Cause: no reverse zone hosted on this server covers the address.
+            The reverse zone is missing, or it lives on servers other than the
+            one you queried.
+            Action: create the reverse zone, or query a server that hosts it.
+            If the network deliberately has no reverse DNS, ignore the value.
+
+        NotApplicable
+            Cause: the entry is a CNAME. CNAME records have no PTR.
+            Action: none.
+
+        Without a snapshot, the other names that share an address and the NS
+        delegations in reverse zones are not known. A PTR that points at
+        another name with the same address then shows as WrongTarget instead
+        of Ok, and a delegated PTR shows as Missing. Run Update-DnsSnapshot
+        first when this matters.
+
+    THE CONFIRMATION GATE
+
+        Every command that changes state decides whether to proceed through
+        one internal gate. In this version only Update-DnsSnapshot uses it;
+        the change commands will use the same gate. The rules are applied in
+        this order.
+
+        1.  -WhatIf: the gate prints a line such as: What if: Performing the
+            operation "<action>" on target "<target>". For example: What if:
+            Performing the operation "Export DNS zones to local snapshot" on
+            target "2 zone(s) on dc01". It then does nothing. (Commands that
+            write the change log will log the attempt with Result = WhatIf.)
+        2.  -Force, or an earlier answer of A (yes to all) in the same command
+            run: the action proceeds without a question.
+        3.  Otherwise the gate asks only if $ConfirmPreference is not None and
+            the impact of the action (Low, Medium or High) is at least
+            $ConfirmPreference. By default $ConfirmPreference is High, so only
+            High-impact actions ask. -Confirm lowers it to Low, so every
+            action asks. -Confirm:$false sets it to None, so nothing asks. An
+            action below the threshold proceeds without a question.
+            Update-DnsSnapshot has impact Low and asks once for the whole
+            export (not once per zone), so it asks only with -Confirm.
+        4.  The question is shown like this:
+
+                Export DNS zones to local snapshot
+                  2 zone(s) on dc01
+                [Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N)
+
+            Y (or yes) approves this action. N skips it. A (or all) approves
+            this action and all later actions of the same command run. S (or
+            stop) stops the whole operation with the error "Operation stopped
+            by the operator." Upper or lower case does not matter. Any other
+            answer, including just pressing Enter, counts as N.
+        5.  If the session cannot ask (a scheduled task, -NonInteractive, a
+            remote session without a console), the action is not performed and
+            the error "This session cannot prompt. Re-run with -Force to
+            confirm all actions, or -WhatIf to preview." is written (ErrorId
+            DnsLathund.Confirm.NonInteractive). Use -Force for unattended
+            runs.
+
+        Update-DnsSnapshot writes only local files. With -WhatIf it reads the
+        zone list from the server, prints one "What if" line and exports
+        nothing; add -Verbose to see the zones and the files they would be
+        written to. -WhatIf creates no folder and no file.
+
+    THE CHANGE LOG
+
+        No command in this version writes to the change log, and none has a
+        -LogPath parameter. The log writer exists so that the planned change
+        commands can use it. They will write each action to the log as one
+        line of compact JSON (JSON Lines). -WhatIf runs will be logged too,
+        with Result = WhatIf, so a rehearsal can be reviewed afterwards.
+
+        The log file is chosen in this order: the -LogPath parameter; the
+        environment variable DNSLATHUND_LOGPATH;
+        %LOCALAPPDATA%\DnsLathund\log\DnsLathund_<yyyy-MM>.jsonl (one file per
+        month). A relative -LogPath is taken from the current folder. The
+        folder is created if needed.
+
+        Every line has these fields, in this order, always present, null when
+        not applicable: Id, BatchId, Timestamp, Operator (DOMAIN\user),
+        Server, Action, Zone, NodeName, Type, Before (Data, Ttl, Timestamp,
+        IsStatic), After, Result and Error. BatchId is shared by all lines
+        written by one command run. Result is one of Success, Failed,
+        Skipped, WhatIf, AlreadyDone, Pending.
+
+        Writing the log never throws. If the file is locked, the module waits
+        200 milliseconds and tries once more. If that fails too, it writes the
+        warning "Could not write the change log '<path>': <reason> The change
+        was not logged." and the DNS operation is not affected.
+
+        Encoding: Windows PowerShell 5.1 writes a UTF-8 byte-order mark (BOM)
+        when it creates the file and PowerShell 7 does not. A BOM is never
+        written in the middle of a file and both editions read either form. To
+        read the log:
+
+            Get-Content -Encoding UTF8 <file> | ConvertFrom-Json |
+                Where-Object Result -eq Failed
+
+    THE AUTOMATION CONTRACT
+
+        The module is written to be called from scheduled scripts. These rules
+        hold for every public command, unless a rule says "planned".
+
+        1.  Objects out, never text. Commands emit typed objects
+            (DnsLathund.Entry, DnsLathund.Snapshot; DnsLathund.Result from
+            the planned change commands). Write-Host is used only for the
+            "What if:" lines. Objects are streamed as they are produced,
+            never collected into an array first.
+        2.  Terminating errors are used only for preconditions that make the
+            whole call pointless. In this version: no default server
+            (LOGONSERVER not set) or an invalid server name; the DnsServer
+            module is missing; the zone list of the server cannot be read;
+            -Credential was given but no CIM session is possible; the
+            snapshot metadata cannot be written; a search needs a snapshot
+            and not one zone could be exported. The message ends with what to
+            do. They are terminating whatever -ErrorAction you pass; use
+            try/catch to handle them.
+        3.  A failure of one item is a non-terminating error (ErrorId
+            DnsLathund.<Function>.<Reason>, the item as TargetObject) and the
+            command continues with the next item. Update-DnsSnapshot reports
+            ExportFailed (a zone whose export failed), ZoneNotFound and
+            ZoneNotExportable (a requested zone). Get-DnsEntry reports
+            ZoneNotFound, PatternWithExact (a wildcard together with -Exact)
+            and InvalidPattern. The planned change commands will add a Result
+            object with Result = Failed. -ErrorAction Stop turns the first
+            such error into a terminating one, so the script stops at the
+            first failed item.
+        4.  Live lookups: a real failure (access denied, server unreachable)
+            is a non-terminating error with the ErrorId
+            DnsLathund.Get-DnsLiveRecord.LookupFailed, and the search goes on
+            with the next zone, value and server. A record that does not
+            exist is silent. PowerShell still records the silenced "not
+            found" answers of the DnsServer cmdlets in $Error and in a
+            caller's -ErrorVariable, so do not use -ErrorVariable to decide
+            whether a call failed. Capture the error stream with 2>&1 and
+            look for ErrorRecord objects, or (planned commands) read the
+            Result objects.
+        5.  Idempotent outcomes are successes. The planned change commands
+            will report Result = AlreadyDone when the wanted state already
+            held, so a script can be run again safely.
+        6.  -Force means zero prompts. Without it, an unattended session gets
+            the "This session cannot prompt" error instead of a hang.
+        7.  Warnings (Write-Warning) mean degraded operation that still gives
+            correct output: a stale snapshot used, a zone skipped, a snapshot
+            file that could not be read. Capture them with -WarningVariable.
+        8.  -Verbose reports every server round-trip and the resolved defaults
+            (server, snapshot folder). Write-Progress is used for work that
+            takes more than a few seconds, at most about every 500
+            milliseconds.
+        9.  -Server defaults to the logon server ($env:LOGONSERVER without the
+            leading backslashes). If that is empty the command throws: No
+            default DNS server (LOGONSERVER is not set). Specify -Server.
+            Scheduled tasks should always pass -Server.
+        10. -Credential sends every DnsServer call through a CIM session,
+            because the DnsServer cmdlets have no -Credential parameter. If no
+            session can be opened the command throws. It never falls back to
+            the logged-on user. Update-DnsSnapshot then copies the export
+            file over WinRM, because the admin$ share cannot use alternate
+            credentials.
+        11. -TimeoutSec (default 300) limits CIM queries and remote commands
+            where the underlying cmdlet supports it.
+        12. A search value that matches nothing gives the warning: No entry
+            matched '<value>' on '<server>'. It is not an error. An address
+            that has PTR records but no A or AAAA record gives the warning:
+            No A/AAAA record has the address '<address>' on '<server>', but
+            <n> PTR record(s) in '<zone>' point at: <targets>. These PTR
+            records are orphaned (Test-DnsConsistency in a later phase
+            reports them).
+
+        A Snapshot object has these properties, in this order: Server, Zone,
+        ExportedAt, Age, IsReverse, ZoneType, ReplicationScope,
+        DirectoryPartitionName, DynamicUpdate, AgingEnabled, FileSizeBytes and
+        Path. The properties of an Entry are listed in Get-Help Get-DnsEntry
+        -Full. A Result object (planned change commands) will have these
+        properties, in this order: Action, Name, Type, Data, Result, Error,
+        Zone, NodeName, Server, Id, BatchId, Timestamp.
+
+    CONSTRAINED LANGUAGE MODE
+
+        Constrained Language Mode (CLM) is a PowerShell language mode that
+        limits what a session may do. Only a short list of core .NET types may
+        be used, methods may be called only on those types, and constructs
+        such as Add-Type, classes and COM objects are blocked. It is normally
+        enforced for a whole computer by an application control policy
+        (Windows Defender Application Control, WDAC, or AppLocker): scripts
+        that the policy does not trust run in CLM.
+
+        To see the mode of your session:
+
+            $ExecutionContext.SessionState.LanguageMode
+
+        The answer is FullLanguage or ConstrainedLanguage.
+
+        The core of DnsLathund is designed to run in CLM. It builds its
+        objects with New-Object PSObject instead of [PSCustomObject], calls no
+        methods on non-core types, creates no .NET objects with constructors,
+        and does not use classes. The three commands of this version therefore
+        work in a constrained session; the module's smoke test runs them in a
+        Constrained Language runspace, against stand-ins for the DnsServer
+        cmdlets. The module records the language mode once, when it is
+        imported.
+
+        Features marked "Full-language only" need a Full-language session. The
+        only one planned is the owner lookup (-IncludeOwner and the Owner
+        property, phase 4). In this version Owner is always null.
+
+        If your organization enforces CLM, ask the person who administers the
+        policy to allow-list the module folder, or to sign the module files,
+        so that the files are trusted and run in Full language. An
+        administrators-only location such as Program Files
+        (Install-DnsLathund.ps1 -Scope AllUsers) is the usual kind of place to
+        trust. Without that, the core commands still work and
+        Full-language-only features do not. Whether the DnsServer module
+        itself loads under a policy-enforced CLM has not been verified yet.
+
+        If a DnsLathund command fails with "Only core types are supported in
+        this language mode" or "Method invocation is supported only on core
+        types in this language mode", that is a defect in the module and not a
+        fault in your policy. Report it to the maintainer with the full error
+        text.
+
+    TROUBLESHOOTING
+
+        The README.md that came with the module has a longer troubleshooting
+        section that quotes every message. The short version:
+
+        - "The DnsServer PowerShell module (RSAT: DNS Server Tools) is not
+          available.": install RSAT. Windows 10 and 11: Add-WindowsCapability
+          -Online -Name Rsat.Dns.Tools~~~~0.0.1.0. Windows Server:
+          Install-WindowsFeature RSAT-DNS-Server. Check with Get-Command
+          Get-DnsServerResourceRecord.
+        - "No default DNS server (LOGONSERVER is not set). Specify -Server.":
+          pass -Server.
+        - "No snapshot exists for '<server>'. Exporting N zone(s) now; ...":
+          not an error. A pattern or substring search found no snapshot and
+          created one. Run Update-DnsSnapshot yourself to choose the moment.
+        - "Zone '<zone>' on '<server>' could not be exported: ...": the text
+          after the colon says which step failed. "Could not export zone ..."
+          means the server refused the export: check the zone is a primary
+          zone and that you are in DnsAdmins or Administrators. "... was
+          exported on '<server>' but the file ... could not be copied here"
+          means the copy back failed. The file is copied from the server
+          through the admin$ share and, if that fails, through WinRM. Both
+          need rights beyond DnsAdmins. Try Test-Path \\<server>\admin$ and
+          Invoke-Command -ComputerName <server> -ScriptBlock { hostname }.
+          Use -Verbose to see what was tried.
+        - "The snapshot of '<server>' is 2d 3h 4m old ... It is used anyway":
+          run Update-DnsSnapshot, or raise -MaxSnapshotAge.
+        - "The snapshot metadata '<path>' could not be read" (and the other
+          meta.json messages): run Update-DnsSnapshot -Server <server> to
+          recreate the snapshot.
+        - "No entry matched '<value>' on '<server>'.": nothing was found; this
+          is not an error. After a "Lookup of ... failed" error it only means
+          the lookup could not be done; fix that error first.
+        - "This session cannot prompt": add -Force, or -WhatIf to preview.
+        - Names with non-ASCII characters look wrong: the input file was saved
+          without a BOM and Windows PowerShell 5.1 read it as ANSI. Save it as
+          UTF-8 with BOM or read it with Get-Content -Encoding UTF8.
+        - Import-Module fails with "running scripts is disabled on this
+          system": run Set-ExecutionPolicy -Scope CurrentUser RemoteSigned,
+          then try again. If Group Policy sets the policy, ask the person who
+          administers your computers.
+
+SEE ALSO
+    Get-DnsEntry, Get-DnsSnapshot, Update-DnsSnapshot
+
+    Planned for later phases: Remove-DnsEntry, New-DnsEntry, Set-DnsEntry,
+    Test-DnsConsistency, Repair-DnsIssue
+
+    Each command has full help: Get-Help <command> -Full, and Get-Help
+    <command> -Examples for examples only.
+
+KEYWORDS
+    DNS, PTR, snapshot, Active Directory, zone, reverse lookup, WhatIf,
+    Constrained Language Mode
