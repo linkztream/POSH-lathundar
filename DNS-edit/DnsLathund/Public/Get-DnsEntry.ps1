@@ -81,11 +81,11 @@
         Pipeline input that arrives after that is still read, but ignored: the
         command cannot stop the commands before it in the pipeline.
 
-    .PARAMETER ExcludeNetwork
+    .PARAMETER MarkDhcpRange
         DHCP or other dynamic ranges in CIDR notation ('10.0.50.0/24',
-        'fd00::/64'). Entries whose address lies in one of them get
-        InDhcpRange = $true; they are still returned. Invalid entries give one
-        warning each and are ignored.
+        'fd00::/64'). Entries whose address lies in one of them are marked:
+        InDhcpRange = $true. Nothing is filtered out; every entry is still
+        returned. Invalid entries give one warning each and are ignored.
 
     .PARAMETER MaxSnapshotAge
         A snapshot older than this is still used, but with a warning that
@@ -134,7 +134,7 @@
         record is confirmed live before it is returned.
 
     .EXAMPLE
-        Get-DnsEntry '*sql*' -Server dc01 -Zone contoso.local -ExcludeNetwork 10.0.50.0/24 | Format-Table Name, Data, PtrStatus, InDhcpRange
+        Get-DnsEntry '*sql*' -Server dc01 -Zone contoso.local -MarkDhcpRange 10.0.50.0/24 | Format-Table Name, Data, PtrStatus, InDhcpRange
 
         Searches the snapshot of dc01 for names containing 'sql' in the zone
         contoso.local and marks the entries whose address is in the DHCP range.
@@ -160,7 +160,7 @@
         - Timestamp (datetime): the aging timestamp; $null for a static record.
         - IsStatic (bool): $true when the record has no aging timestamp.
         - HasDhcid (bool): a DHCID record exists at the node (from the snapshot); $null when no snapshot was used.
-        - InDhcpRange (bool): the address lies in one of the -ExcludeNetwork networks.
+        - InDhcpRange (bool): the address lies in one of the -MarkDhcpRange networks.
         - ReverseZone (string): the reverse zone that should hold the PTR (the longest hosted one); $null for a CNAME or when none is hosted.
         - PtrTargets (string[]): the targets of the PTR records found for the address; @() when none was found, $null when not evaluated.
         - PtrZoneFound (string): the zone where the PTR was found, or that holds the CNAME target of a Delegated PTR.
@@ -239,7 +239,7 @@
 
         [Parameter()]
         [ValidateNotNullOrEmpty()]
-        [string[]]$ExcludeNetwork,
+        [string[]]$MarkDhcpRange,
 
         [Parameter()]
         [timespan]$MaxSnapshotAge = (New-TimeSpan -Hours 24),
@@ -284,7 +284,7 @@
         # Test-DnsAddressInNetwork; calling it with a silenced warning would still
         # leave the warning in a caller's -WarningVariable.
         $networks = [string[]]@(
-            foreach ($networkEntry in @($ExcludeNetwork)) {
+            foreach ($networkEntry in @($MarkDhcpRange)) {
                 if ($null -eq $networkEntry) {
                     continue
                 }

@@ -614,8 +614,8 @@ Describe 'Get-DnsEntry with a snapshot' {
         (Get-DnsEntry -Find 'srv01.contoso.local' -Server $script:Server).Target | Should -BeNullOrEmpty
     }
 
-    It 'marks InDhcpRange with -ExcludeNetwork and ignores an invalid network with one warning' {
-        $entries = @(Get-DnsEntry -Find 'dhcp17.contoso.local', 'srv01*', '10.0.50.17' -ExcludeNetwork '10.0.50.0/24', 'not-a-network' -Server $script:Server -WarningVariable warnings -WarningAction SilentlyContinue)
+    It 'marks InDhcpRange with -MarkDhcpRange and ignores an invalid network with one warning' {
+        $entries = @(Get-DnsEntry -Find 'dhcp17.contoso.local', 'srv01*', '10.0.50.17' -MarkDhcpRange '10.0.50.0/24', 'not-a-network' -Server $script:Server -WarningVariable warnings -WarningAction SilentlyContinue)
 
         $entries.Count | Should -Be 3
         $entries[0].InDhcpRange | Should -BeTrue
