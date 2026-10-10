@@ -1,0 +1,27 @@
+;
+;  Database file (null) for Default zone scope in zone 0/25.16.0.10.in-addr.arpa.
+;      Zone version:  12
+;
+
+@                       IN  SOA dc01.contoso.local. hostmaster.contoso.local. (
+                        		12           ; serial number
+                        		900          ; refresh
+                        		600          ; retry
+                        		86400        ; expire
+                        		1200       ) ; default TTL
+
+;
+;  Zone NS records
+;
+
+@                       NS	dc01.contoso.local.
+
+;
+;  Zone records
+;
+
+5                       PTR	srv05.contoso.local.
+10                      [AGE:3731340]	1200	PTR	ws-10.contoso.local.
+11                      [AGE:3731341]	1200	PTR	ws-11.contoso.local.
+127                     PTR	edge-127.contoso.local.
+200                     PTR	outside.contoso.local.

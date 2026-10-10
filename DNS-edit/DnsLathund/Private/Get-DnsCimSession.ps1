@@ -1,132 +1,107 @@
 ﻿function Get-DnsCimSession {
     <#
-        .SYNOPSIS
-            Hämtar (och cachar) en verifierad CIM-session mot en DNS-server.
+    .SYNOPSIS
+        Returns a cached, verified CIM session to a DNS server, or $null.
 
-        .DESCRIPTION
-            Försöker först med WSMan och verifierar sessionen genom att läsa
-            MicrosoftDNS_Server i namnrymden root\MicrosoftDNS med 15 sekunders
-            timeout. Misslyckas det görs ett omförsök över DCOM. Fungerar inte
-            heller det cachas markören 'Unavailable' för servern och $null
-            returneras — anroparen får då falla tillbaka på zonexportvägen.
+    .DESCRIPTION
+        The DnsServer cmdlets have no -Credential parameter, so alternate
+        credentials can only be used through a CIM session. This helper opens one
+        with WSMan first and DCOM as fallback (DCOM still works where WinRM is
+        blocked), and verifies it by querying MicrosoftDNS_Server in the
+        root\MicrosoftDNS namespace: a session that opens but cannot see the DNS
+        provider is useless for the DnsServer cmdlets.
 
-            Funktionen kastar aldrig. Sessioner cachas per server (gemener) i
-            $script:DnsCimSessionCache och stängs när modulen tas bort.
+        Results are cached per server in $script:CimSessionCache. A server where no
+        session could be opened is cached as 'Unavailable' so that every later call
+        fails fast instead of waiting for two more timeouts. The module's OnRemove
+        handler closes cached sessions.
 
-        .EXAMPLE
-            $session = Get-DnsCimSession -ComputerName 'dc01'
+        Returns $null when no session can be opened; the caller decides whether that
+        is fatal (Get-DnsServerParameter throws when credentials were given).
 
-            Returnerar en CimSession eller $null om CIM inte är nåbart.
+    .PARAMETER Server
+        The DNS server name.
 
-        .EXAMPLE
-            $session = Get-DnsCimSession -ComputerName 'dc01' -Credential (Get-Credential)
+    .PARAMETER Credential
+        Alternate credentials for the session. Without it the session runs as the
+        logged-on user.
 
-            Öppnar sessionen med andra uppgifter.
+    .PARAMETER TimeoutSec
+        Operation timeout for opening and verifying the session.
+
+    .EXAMPLE
+        Get-DnsCimSession -Server 'dc01' -Credential $cred
+
+        Returns a CIM session to dc01, or $null when neither WSMan nor DCOM works.
     #>
     [CmdletBinding()]
-    [OutputType([Microsoft.Management.Infrastructure.CimSession])]
+    [OutputType('Microsoft.Management.Infrastructure.CimSession')]
     param (
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string]$ComputerName,
+        [string]$Server,
 
         [Parameter()]
         [AllowNull()]
-        [System.Management.Automation.PSCredential]
-        [System.Management.Automation.Credential()]
-        $Credential
+        [pscredential]$Credential,
+
+        [Parameter()]
+        [ValidateRange(1, 86400)]
+        [int]$TimeoutSec = 300
     )
 
-    $cacheKey = $ComputerName.ToLowerInvariant()
-
-    if ($script:DnsCimSessionCache.ContainsKey($cacheKey)) {
-        $cached = $script:DnsCimSessionCache[$cacheKey]
-
-        if ($cached -is [string] -and $cached -eq 'Unavailable') {
+    $cacheKey = $Server.ToLowerInvariant()
+    if ($script:CimSessionCache.ContainsKey($cacheKey)) {
+        $cachedSession = $script:CimSessionCache[$cacheKey]
+        if ($cachedSession -is [string]) {
+            Write-Verbose "No CIM session to '$cacheKey' (an earlier attempt failed in this session)."
             return $null
         }
 
-        if ($cached -is [Microsoft.Management.Infrastructure.CimSession]) {
-            return $cached
+        Write-Verbose "Reusing the cached CIM session to '$cacheKey'."
+        return $cachedSession
+    }
+
+    foreach ($protocol in @('Wsman', 'Dcom')) {
+        $sessionParameters = @{
+            ComputerName        = $Server
+            SessionOption       = New-CimSessionOption -Protocol $protocol
+            OperationTimeoutSec = $TimeoutSec
+            ErrorAction         = 'Stop'
         }
-    }
+        if ($null -ne $Credential) {
+            $sessionParameters['Credential'] = $Credential
+        }
 
-    $commonParameters = @{
-        ComputerName = $ComputerName
-        ErrorAction  = 'Stop'
-    }
+        $session = $null
+        try {
+            Write-Verbose "Opening a $protocol CIM session to '$Server'."
+            $session = New-CimSession @sessionParameters
+        }
+        catch {
+            Write-Verbose "$protocol CIM session to '$Server' failed: $($_.Exception.Message)"
+            continue
+        }
 
-    if ($null -ne $Credential) {
-        $commonParameters['Credential'] = $Credential
-    }
-
-    $lastError = $null
-
-    # Försök 1: WSMan (standardprotokollet).
-    $session = $null
-
-    try {
-        $session = New-CimSession @commonParameters
-
-        $null = Get-CimInstance `
-            -CimSession $session `
-            -Namespace 'root\MicrosoftDNS' `
-            -ClassName 'MicrosoftDNS_Server' `
-            -OperationTimeoutSec 15 `
-            -ErrorAction Stop
-
-        $script:DnsCimSessionCache[$cacheKey] = $session
-
-        return $session
-    }
-    catch {
-        $lastError = $_.Exception.Message
-
-        if ($null -ne $session) {
+        try {
+            Write-Verbose "Verifying root\MicrosoftDNS on '$Server' over $protocol."
+            $null = Get-CimInstance -CimSession $session -Namespace 'root\MicrosoftDNS' -Query 'SELECT Name FROM MicrosoftDNS_Server' -OperationTimeoutSec $TimeoutSec -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose "$protocol CIM session to '$Server' cannot read root\MicrosoftDNS: $($_.Exception.Message)"
             try {
-                Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue
+                Remove-CimSession -CimSession $session -ErrorAction Stop
             }
             catch {
-                # Ignoreras medvetet.
+                Write-Verbose "Could not close the unusable $protocol session to '$Server': $($_.Exception.Message)"
             }
-
-            $session = $null
+            continue
         }
-    }
 
-    # Försök 2: DCOM.
-    try {
-        $dcomOption = New-CimSessionOption -Protocol Dcom
-
-        $session = New-CimSession @commonParameters -SessionOption $dcomOption
-
-        $null = Get-CimInstance `
-            -CimSession $session `
-            -Namespace 'root\MicrosoftDNS' `
-            -ClassName 'MicrosoftDNS_Server' `
-            -OperationTimeoutSec 15 `
-            -ErrorAction Stop
-
-        $script:DnsCimSessionCache[$cacheKey] = $session
-
+        $script:CimSessionCache[$cacheKey] = $session
         return $session
     }
-    catch {
-        $lastError = $_.Exception.Message
 
-        if ($null -ne $session) {
-            try {
-                Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue
-            }
-            catch {
-                # Ignoreras medvetet.
-            }
-        }
-    }
-
-    $script:DnsCimSessionCache[$cacheKey] = 'Unavailable'
-
-    Write-Verbose "CIM är inte nåbart mot '$ComputerName' (varken WSMan eller DCOM): $lastError"
-
+    $script:CimSessionCache[$cacheKey] = 'Unavailable'
     return $null
 }

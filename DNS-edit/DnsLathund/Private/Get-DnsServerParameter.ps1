@@ -1,59 +1,69 @@
 ﻿function Get-DnsServerParameter {
     <#
-        .SYNOPSIS
-            Bygger serverparametrarna (CimSession eller ComputerName) för
-            DnsServer-cmdletarna.
+    .SYNOPSIS
+        Returns the splat that targets a DNS server with the DnsServer cmdlets.
 
-        .DESCRIPTION
-            DnsServer-cmdletarna saknar -Credential. Enda sättet att köra dem
-            som någon annan än den inloggade användaren är en CIM-session.
+    .DESCRIPTION
+        Every DnsServer cmdlet call in the module is splatted with the hashtable
+        returned here, so that alternate credentials are honoured everywhere or
+        nowhere.
 
-            Modulens regel: anges -Credential MÅSTE anropet gå via en
-            CIM-session. Går den inte att upprätta kastas ett fel — vi faller
-            aldrig tillbaka på -ComputerName, eftersom det tyst hade kört med
-            den inloggade användarens rättigheter i stället för de angivna.
-            Vid borttagning av poster vore en sådan tyst nedgradering direkt
-            farlig.
+        Without credentials the result is @{ ComputerName = <server> } and the
+        cmdlets run as the logged-on user. With credentials the result is
+        @{ CimSession = <session> } from Get-DnsCimSession. When credentials are
+        given but no CIM session can be opened, this throws: silently falling back
+        to the logged-on user could make changes under the wrong identity.
 
-            Utan -Credential returneras @{ ComputerName = <server> }.
+    .PARAMETER Server
+        The DNS server name.
 
-            Resultatet är avsett att splattas in i DnsServer-cmdletarna:
-            Get-DnsServerResourceRecord @serverParameters -ZoneName ...
+    .PARAMETER Credential
+        Alternate credentials. $null (or a credential without a user name, such as
+        [pscredential]::Empty) means the logged-on user.
 
-        .EXAMPLE
-            $serverParameters = Get-DnsServerParameter -ComputerName 'dc01'
+    .PARAMETER TimeoutSec
+        Passed on to Get-DnsCimSession.
 
-            Ger @{ ComputerName = 'dc01' }.
+    .EXAMPLE
+        $serverParameters = Get-DnsServerParameter -Server 'dc01'
+        Get-DnsServerZone @serverParameters
 
-        .EXAMPLE
-            $serverParameters = Get-DnsServerParameter -ComputerName 'dc01' -Credential $credential
+        Lists the zones on dc01 as the logged-on user.
 
-            Ger @{ CimSession = <CimSession> } eller kastar om ingen session
-            kunde upprättas.
+    .EXAMPLE
+        $serverParameters = Get-DnsServerParameter -Server 'dc01' -Credential $cred
+        Get-DnsServerZone @serverParameters
+
+        Lists the zones on dc01 through a CIM session that uses $cred, or throws
+        when no session can be opened.
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
     param (
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string]$ComputerName,
+        [string]$Server,
 
         [Parameter()]
         [AllowNull()]
-        [System.Management.Automation.PSCredential]
-        [System.Management.Automation.Credential()]
-        $Credential
+        [pscredential]$Credential,
+
+        [Parameter()]
+        [ValidateRange(1, 86400)]
+        [int]$TimeoutSec = 300
     )
 
-    if ($null -eq $Credential) {
-        return @{ ComputerName = $ComputerName }
+    $hasCredential = ($null -ne $Credential) -and ('' -ne [string]$Credential.UserName)
+    if (-not $hasCredential) {
+        Write-Verbose "DnsServer cmdlets target '$Server' as the logged-on user."
+        return @{ ComputerName = $Server }
     }
 
-    $cimSession = Get-DnsCimSession -ComputerName $ComputerName -Credential $Credential
-
-    if ($null -eq $cimSession) {
-        throw "Ingen CIM-session kunde upprättas mot '$ComputerName', vilket krävs när -Credential anges."
+    $session = Get-DnsCimSession -Server $Server -Credential $Credential -TimeoutSec $TimeoutSec
+    if ($null -eq $session) {
+        throw "Could not open a CIM session to '$Server' as '$($Credential.UserName)' (tried WSMan and DCOM). Check that WinRM or DCOM is reachable and that the account may read DNS, or omit -Credential to run as the logged-on user."
     }
 
-    return @{ CimSession = $cimSession }
+    Write-Verbose "DnsServer cmdlets target '$Server' through a CIM session as '$($Credential.UserName)'."
+    @{ CimSession = $session }
 }

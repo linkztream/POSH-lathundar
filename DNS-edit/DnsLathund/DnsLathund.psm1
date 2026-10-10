@@ -1,73 +1,78 @@
-﻿#Requires -Version 5.1
+﻿Set-StrictMode -Version Latest
 
-<#
-    DnsLathund — modulladdare.
+# Module state (CONTRACTS.md section 7.1). Keys of every cache are lower-case server names.
+$script:ModuleRoot             = $PSScriptRoot
+$script:LanguageMode           = [string]$ExecutionContext.SessionState.LanguageMode
+$script:ZoneTableCache         = @{}
+$script:CimSessionCache        = @{}
+$script:SnapshotIndexCache     = @{}
+$script:DnsServerModuleChecked = $false
 
-    Laddar alla .ps1-filer under Private\ och därefter Public\, exporterar de
-    publika funktionerna och initierar de script-scope-cachar som de privata
-    hjälparna använder.
-#>
+# Where Export-DnsServerZone drops its file on the DNS server. Read when the server is
+# this machine; tests point it at TestDrive together with the stub export root.
+$script:DnsServerExportRoot    = Join-Path $env:windir 'System32\dns'
+$script:SnapshotRoot           = $null   # Snapshot root override (Get-DnsSnapshotRoot); $null = DNSLATHUND_SNAPSHOTPATH or %LOCALAPPDATA%. Tests point it at TestDrive.
 
-$script:ModuleRoot = $PSScriptRoot
-
-# Script-scope-cachar. Nycklas på gemener av ComputerName.
-$script:DnsZoneCache = @{}
-$script:DnsCimSessionCache = @{}
-
-# Cache för Assert-DnsServerModule (sätts av hjälparen vid första lyckade koll).
-$script:DnsServerModuleVerified = $false
-
-foreach ($folder in @('Private', 'Public')) {
-    $folderPath = Join-Path -Path $PSScriptRoot -ChildPath $folder
-
-    if (-not (Test-Path -LiteralPath $folderPath)) {
+# Private helpers first so that public functions can rely on them while loading.
+# A folder that does not exist yet is simply skipped, so the module imports during
+# phased development.
+$publicFunctionNames = [ordered]@{}
+foreach ($folderName in @('Private', 'Public')) {
+    $folderPath = Join-Path -Path $PSScriptRoot -ChildPath $folderName
+    if (-not (Test-Path -LiteralPath $folderPath -PathType Container)) {
         continue
     }
 
-    $scriptFiles = @(
-        Get-ChildItem -LiteralPath $folderPath -Filter '*.ps1' -File -ErrorAction Stop |
-            Sort-Object -Property Name
-    )
+    # -Filter '*.ps1' also matches '.ps1xml' through 8.3 short names, hence the extension check.
+    $sourceFiles = Get-ChildItem -LiteralPath $folderPath -File |
+        Where-Object { $_.Extension -eq '.ps1' } |
+        Sort-Object -Property Name
 
-    foreach ($scriptFile in $scriptFiles) {
+    foreach ($sourceFile in $sourceFiles) {
         try {
-            . $scriptFile.FullName
+            . $sourceFile.FullName
         }
         catch {
-            throw "Kunde inte ladda modulfilen '$($scriptFile.Name)': $($_.Exception.Message)"
+            throw "DnsLathund: failed to load '$($sourceFile.FullName)': $($_.Exception.Message)"
+        }
+
+        if ($folderName -eq 'Public') {
+            $publicFunctionNames[$sourceFile.BaseName] = $true
         }
     }
 }
 
-$publicFunctions = @(
-    'Find-DnsRecord'
-    'Get-DnsOrphanPtr'
-    'Remove-DnsHostRecord'
-    'Remove-DnsPtrRecord'
-    'Invoke-DnsRecordEditor'
-)
+# The manifest's FunctionsToExport narrows this further; exporting only what exists
+# keeps the import clean while Public\ is still being filled.
+Export-ModuleMember -Function @($publicFunctionNames.Keys)
 
-Export-ModuleMember -Function $publicFunctions
+Remove-Variable -Name publicFunctionNames, folderName, folderPath, sourceFiles, sourceFile -ErrorAction SilentlyContinue
 
-# Städa upp eventuella CIM-sessioner när modulen tas bort. Får aldrig kasta.
-$ExecutionContext.SessionState.Module.OnRemove = {
-    try {
-        if ($script:DnsCimSessionCache) {
-            foreach ($cachedSession in @($script:DnsCimSessionCache.Values)) {
-                try {
-                    if ($cachedSession -is [Microsoft.Management.Infrastructure.CimSession]) {
-                        Remove-CimSession -CimSession $cachedSession -ErrorAction SilentlyContinue
-                    }
-                }
-                catch {
-                    # Ignoreras medvetet — modulen tas bort ändå.
-                }
-            }
+$onRemove = {
+    foreach ($cachedSession in @($script:CimSessionCache.Values)) {
+        # 'Unavailable' marks a server where no session could be opened.
+        if ($null -eq $cachedSession -or $cachedSession -is [string]) {
+            continue
+        }
 
-            $script:DnsCimSessionCache.Clear()
+        try {
+            Remove-CimSession -CimSession $cachedSession -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose "DnsLathund: could not close a cached CIM session: $($_.Exception.Message)"
         }
     }
-    catch {
-        # Ignoreras medvetet.
-    }
+
+    $script:CimSessionCache = @{}
 }
+
+# Constrained Language Mode refuses property assignment on PSModuleInfo ("Property
+# setting is supported only on core types"). There the handler is not registered and
+# cached sessions close when the process exits; the import itself must not fail.
+try {
+    $ExecutionContext.SessionState.Module.OnRemove = $onRemove
+}
+catch {
+    Write-Verbose "DnsLathund: cached CIM sessions will not be closed on Remove-Module in $script:LanguageMode mode."
+}
+Remove-Variable -Name onRemove -ErrorAction SilentlyContinue
