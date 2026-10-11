@@ -1,35 +1,27 @@
 ﻿@{
-    RootModule            = 'DnsLathund.psm1'
-    ModuleVersion         = '0.1.0'
-    GUID                  = 'a470d7fe-af54-4636-b760-f36627b1214d'
-    Author                = 'Pär Lindström'
-    CompanyName           = 'Unknown'
-    Copyright             = '(c) Pär Lindström. Alla rättigheter förbehållna.'
-    Description           = 'Verktyg för DNS-administration i mycket stora Microsoft DNS-miljöer: sökning, orphan-PTR-jakt och säker borttagning av A- och PTR-poster.'
+    RootModule           = 'DnsLathund.psm1'
+    ModuleVersion        = '1.0.0'
+    GUID                 = 'a470d7fe-af54-4636-b760-f36627b1214d'
+    Author               = 'Pär Lindström'
+    CompanyName          = 'Unknown'
+    Copyright            = '(c) Pär Lindström. All rights reserved.'
+    Description          = 'Find, audit, repair, create and remove A, AAAA, PTR and CNAME records in large Microsoft DNS (Active Directory-integrated) environments. Searches run against cached zone exports, changes are verified live, and the core runs in Constrained Language Mode.'
+    PowerShellVersion    = '5.1'
+    CompatiblePSEditions = @('Desktop', 'Core')
 
-    PowerShellVersion     = '5.1'
-    CompatiblePSEditions  = @('Desktop', 'Core')
+    # The DnsServer module (RSAT) is imported lazily by Import-DnsServerModule so
+    # that the module can be imported, and tested with stubs, on machines without RSAT.
+    FormatsToProcess     = @('DnsLathund.Format.ps1xml')
 
-    # DnsServer (RSAT) listas medvetet INTE här. Modulen ska kunna importeras
-    # på en dev-maskin utan RSAT; Assert-DnsServerModule kontrollerar i stället
-    # vid anrop av de funktioner som faktiskt behöver DnsServer-cmdletarna.
-    RequiredModules       = @()
+    FunctionsToExport    = @('Get-DnsEntry', 'Get-DnsSnapshot', 'Update-DnsSnapshot')
+    CmdletsToExport      = @()
+    VariablesToExport    = @()
+    AliasesToExport      = @()
 
-    FunctionsToExport     = @(
-        'Find-DnsRecord'
-        'Get-DnsOrphanPtr'
-        'Remove-DnsHostRecord'
-        'Remove-DnsPtrRecord'
-        'Invoke-DnsRecordEditor'
-    )
-    CmdletsToExport       = @()
-    VariablesToExport     = @()
-    AliasesToExport       = @()
-
-    PrivateData           = @{
+    PrivateData          = @{
         PSData = @{
-            Tags         = @('DNS', 'DnsServer', 'PTR', 'Windows', 'RSAT')
-            ReleaseNotes = 'Fas 0: modulställning, privata hjälpare och objektkontrakt.'
+            Tags         = @('DNS', 'DnsServer', 'ActiveDirectory', 'PTR', 'ReverseLookup', 'Audit', 'ConstrainedLanguage', 'Windows')
+            ReleaseNotes = 'Phase 1: module foundation, zone table, zone snapshots and Get-DnsEntry.'
         }
     }
 }

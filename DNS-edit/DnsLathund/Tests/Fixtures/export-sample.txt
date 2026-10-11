@@ -1,0 +1,76 @@
+;
+;  Database file (null) for Default zone scope in zone contoso.local.
+;      Zone version:  4711
+;
+
+@                       IN  SOA dc01.contoso.local. hostmaster.contoso.local. (
+                        		4711         ; serial number
+                        		900          ; refresh
+                        		600          ; retry
+                        		86400        ; expire
+                        		3600       ) ; default TTL
+
+;
+;  Zone NS records
+;
+
+@                       NS	dc01.contoso.local.
+@                       NS	dc02.contoso.local.
+
+;
+;  Zone records
+;
+
+@                       [AGE:3731340]	600	A	10.0.16.1
+@                       [AGE:3731333]	600	A	10.0.16.2
+@                       [AGE:3731341]	600	AAAA	fd00:db8:0:16::1
+@                       MX	10 mail01.contoso.local.
+@                       TXT	"v=spf1 mx -all"
+@                       WINS	L1 C2 ( 10.0.16.10 10.0.16.11 )
+
+;
+;  Delegated sub-zone:  lab.contoso.local.
+;
+lab                     NS	dc03.lab.contoso.local.
+;  End delegation
+
+;
+;  Delegated sub-zone:  _msdcs.contoso.local.
+;
+_msdcs                  NS	dc01.contoso.local.
+;  End delegation
+
+_ldap._tcp.Default-First-Site-Name._sites [AGE:3731340]	600	SRV	0 100 389	dc01.contoso.local.
+                        [AGE:3731339]	600	SRV	0 100 389	dc02.contoso.local.
+_kerberos._tcp          [AGE:3731340]	600	SRV	0 100 88	dc01.contoso.local.
+                        [AGE:3731339]	600	SRV	0 100 88	dc02.contoso.local.
+*                       A	10.0.16.99
+alias01                 CNAME	SRV01.contoso.local.
+app\040server           A	10.0.16.77
+dc01                    A	10.0.16.10
+                        AAAA	fd00:db8:0:16::10
+DC02                    A	10.0.16.11
+DomainDnsZones          [AGE:3731333]	600	A	10.0.16.10
+                        [AGE:3731340]	600	A	10.0.16.11
+kontor-åäö              [AGE:3731322]	900	A	10.0.8.17
+                        [AGE:3731322]	900	DHCID	AAIBqu7IM9Z2I1UVMaqmiXbT3crwOxh27q34yqpCQldN7Pg=
+Laptop-0042             [AGE:3731363]	900	A	10.0.8.42
+                        [AGE:3731363]	900	DHCID	AAEBiWNjeNak5P4I34d3ZzNzbjCShtlF0ae/VtuOdlxXMHw=
+                        [AGE:3731363]	900	AAAA	fd00:db8:0:8::42
+mail01                  A	10.0.16.25
+                        TXT	"owner=it-ops"
+printer-floor03-building-a-17 [AGE:3731350]	900	A	10.0.64.17
+                        [AGE:3731350]	900	DHCID	AAABadIXvjbmeouVqVpu+YhjoBjJ0GofGWidA2NtgqyA2t8=
+sip                     CNAME	sip.example.net.
+srv01                   300	A	10.0.16.20
+srv02                   A	10.0.16.21
+                        A	10.0.16.22
+                        MX	20 mail01.contoso.local.
+web                     CNAME	srv01
+fs01.contoso.local.     A	10.0.16.40
+$ORIGIN branch.contoso.local.
+@                       CNAME	kiosk1.branch.contoso.local.
+kiosk1                  [AGE:3731218]	1200	A	10.20.0.11
+kiosk2                  A	10.20.0.12
+$ORIGIN contoso.local.
+zz-static               7200	A	10.0.16.200
