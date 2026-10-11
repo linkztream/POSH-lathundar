@@ -30,7 +30,7 @@ are planned to behave. None of them exists in this version.
   `-Force` (`-Force` means "no prompts at all", for unattended runs).
 - `Remove-DnsEntry` (planned for phase 2) will refuse to remove a name that an
   NS or SRV record still points at, unless you pass the switch
-  `-IncludeInfrastructure`.
+  `-AllowReferenced`.
 - They will never create a PTR record for a dynamic record (one with a
   timestamp, registered by DHCP or by the client itself).
 - Every change will be written to the change log (see
@@ -317,8 +317,10 @@ Useful parameters:
 - `-MarkDhcpRange '10.0.50.0/24', 'fd00::/64'` marks the entries whose address
   lies in those networks: `InDhcpRange` becomes `$true`. Nothing is removed;
   filter with `Where-Object { -not $_.InDhcpRange }`.
-- `-MaxSnapshotAge (New-TimeSpan -Hours 4)` changes the staleness limit of the
-  snapshot (default 24 hours): an older snapshot is still used, with a warning.
+- `-MaxSnapshotAge 04:00:00` changes the snapshot age you accept (default 24
+  hours): an older snapshot is still used, with a warning. Write the value as
+  `d.hh:mm:ss` (`2.00:00:00` is two days) or with `New-TimeSpan`; a bare number
+  such as `4` means 4 ticks, not 4 hours.
 - `-Server dc01, dc02` repeats the whole search on every server. Each entry
   carries its `Server`. Every server has its own snapshot.
 - `-Credential` runs every DnsServer call through a CIM session as another
@@ -423,7 +425,7 @@ Planned for a later phase.
 #### Set-DnsEntry
 Planned for a later phase.
 
-#### Test-DnsConsistency
+#### Get-DnsIssue
 Planned for a later phase.
 
 #### Repair-DnsIssue
@@ -770,7 +772,7 @@ lookup failures (below); read the errors above it.
 
 **Warning "No A/AAAA record has the address '<address>' on '<server>', but <n>
 PTR record(s) in '<zone>' point at: <targets>. These PTR records are orphaned
-(Test-DnsConsistency in a later phase reports them)."** The address has PTR
+(Get-DnsIssue in a later phase reports them)."** The address has PTR
 records, but no A or AAAA record uses it: the host is gone and its PTR stayed
 behind. Decide whether the targets still exist (`Get-DnsEntry -Find <target>`) and,
 if not, remove the PTR records in DNS Manager or with the DnsServer cmdlets. Today

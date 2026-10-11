@@ -89,7 +89,9 @@
 
     .PARAMETER MaxSnapshotAge
         A snapshot older than this is still used, but with a warning that
-        suggests Update-DnsSnapshot. Default: 24 hours.
+        suggests Update-DnsSnapshot. Default: 24 hours. Write it as
+        d.hh:mm:ss ('04:00:00', '2.00:00:00') or with New-TimeSpan; a bare
+        number such as 4 is read as 4 ticks, not 4 hours.
 
     .PARAMETER Credential
         Alternate credentials. All DnsServer calls then go through a CIM session;
@@ -227,6 +229,7 @@
         [string[]]$Server,
 
         [Parameter()]
+        [Alias('ZoneName')]
         [ValidateNotNullOrEmpty()]
         [string]$Zone,
 
@@ -758,7 +761,7 @@
                                 "{0} PTR record(s) in '{1}' point at: {2}" -f $ptrTargetsByZone[$ptrZone].Count, $ptrZone, ($ptrTargetsByZone[$ptrZone] -join ', ')
                             }
                         ) -join '; '
-                        Write-Warning "No A/AAAA record has the address '$address' on '$serverKey', but $ptrSummary. These PTR records are orphaned (Test-DnsConsistency in a later phase reports them)."
+                        Write-Warning "No A/AAAA record has the address '$address' on '$serverKey', but $ptrSummary. These PTR records are orphaned (Get-DnsIssue in a later phase reports them)."
                     }
                     else {
                         Write-Warning "No entry matched '$display' on '$serverKey'."

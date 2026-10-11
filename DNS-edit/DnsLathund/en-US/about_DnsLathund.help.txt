@@ -33,7 +33,7 @@ LONG DESCRIPTION
 
         The commands that change records (Remove-DnsEntry, New-DnsEntry,
         Set-DnsEntry, Repair-DnsIssue) and the consistency audit
-        (Test-DnsConsistency) are planned for later phases. Where this topic
+        (Get-DnsIssue) are planned for later phases. Where this topic
         describes how change commands behave (the confirmation gate, the
         change log, Result objects), that is how they are planned to behave
         and the text says so. No command in this version writes to the
@@ -351,8 +351,8 @@ LONG DESCRIPTION
             that has PTR records but no A or AAAA record gives the warning:
             No A/AAAA record has the address '<address>' on '<server>', but
             <n> PTR record(s) in '<zone>' point at: <targets>. These PTR
-            records are orphaned (Test-DnsConsistency in a later phase
-            reports them).
+            records are orphaned (Get-DnsIssue in a later phase reports
+            them).
 
         A Snapshot object has these properties, in this order: Server, Zone,
         ExportedAt, Age, IsReverse, ZoneType, ReplicationScope,
@@ -452,7 +452,7 @@ SEE ALSO
     Get-DnsEntry, Get-DnsSnapshot, Update-DnsSnapshot
 
     Planned for later phases: Remove-DnsEntry, New-DnsEntry, Set-DnsEntry,
-    Test-DnsConsistency, Repair-DnsIssue
+    Get-DnsIssue, Repair-DnsIssue
 
     Each command has full help: Get-Help <command> -Full, and Get-Help
     <command> -Examples for examples only.

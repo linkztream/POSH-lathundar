@@ -345,7 +345,7 @@ Describe 'Get-DnsEntry without a snapshot (live lookups)' {
         $records.Count | Should -Be 0
         @($warnings).Count | Should -Be 1
         "$($warnings[0])" | Should -BeExactly ("No A/AAAA record has the address '10.0.16.33' on '$($script:Server)', but 2 PTR record(s) in '16.0.10.in-addr.arpa' " +
-            'point at: ghost.contoso.local, io sense.lab.example. These PTR records are orphaned (Test-DnsConsistency in a later phase reports them).')
+            'point at: ghost.contoso.local, io sense.lab.example. These PTR records are orphaned (Get-DnsIssue in a later phase reports them).')
 
         # With -Zone the A record may live in another zone, so the plain warning stays.
         $null = Get-DnsEntry -Find '10.0.16.33' -Zone 'contoso.local' -Server $script:Server -WarningVariable zoneWarnings -WarningAction SilentlyContinue

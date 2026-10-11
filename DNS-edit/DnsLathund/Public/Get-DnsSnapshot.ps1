@@ -98,6 +98,7 @@
         [string[]]$Server,
 
         [Parameter()]
+        [Alias('ZoneName')]
         [ValidateNotNullOrEmpty()]
         [string[]]$Zone
     )

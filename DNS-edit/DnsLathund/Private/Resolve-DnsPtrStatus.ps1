@@ -46,7 +46,7 @@
           SharedWith    string[] of the other names with an A/AAAA for the address
                         (index needed), @() when there are none, $null without index
 
-        The helper knows nothing about Get-DnsEntry, so Test-DnsConsistency can reuse
+        The helper knows nothing about Get-DnsEntry, so Get-DnsIssue can reuse
         it.
 
     .PARAMETER Address

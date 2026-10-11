@@ -101,6 +101,14 @@ enough to make a helper available – no registration lists.
   not import another product's term for a concept the module already
   names (`ReplicationScope` and zone scope are taken, so DHCP networks are
   "Range", never "Scope").
+- **Established PowerShell names win when they pass the first rule**
+  (`-Path` on Backup-*, `-Delay` in seconds like Restart-Computer, `-Name`
+  for a record owner, `-ComputerName`); when they do not, they become
+  aliases (`-ZoneName` for `-Zone`, `-TimeToLive` for `-TTL`, `-FilePath`
+  for `-InputFile`). Timespan parameters are documented in `d.hh:mm:ss`
+  form, because a bare integer converts to ticks. Guiding spirit for all
+  of it: PEP 20, explicit over implicit, readability counts, practicality
+  beats purity.
 - **No `Write-Host`** outside `Confirm-DnsAction`. `Write-Verbose` for
   diagnostics, `Write-Warning` for degraded-but-continuing, `Write-Progress`
   for anything over a few seconds (throttled, see §15).
