@@ -11,13 +11,16 @@
 
         1. $WhatIfPreference is set: print the standard "What if:" line with
            Write-Host and return $false.
-        2. -Force, or $State.All set by an earlier "Yes to all": return $true.
+        2. -Force, or an earlier "Yes to all" for the same impact level
+           ($State.All[$Impact]): return $true.
         3. Prompt only when $ConfirmPreference is not 'None' and the action's
            impact is at least $ConfirmPreference; otherwise return $true.
            -Confirm:$false sets 'None' (never prompt), -Confirm sets 'Low'.
-        4. Prompt with Read-Host: Y/Yes returns $true; A/All sets $State.All and
-           returns $true; S/Stop throws "Operation stopped by the operator.";
-           anything else (including just Enter) returns $false.
+        4. Prompt with Read-Host: Y/Yes returns $true; A/All sets
+           $State.All[$Impact] and returns $true; S/Stop throws "Operation stopped
+           by the operator."; anything else (including just Enter) returns $false.
+           "Yes to all" is remembered per impact level, so answering A to a Medium
+           prompt never approves a later High action such as creating a zone.
         5. When the host cannot prompt (Read-Host throws, for example under
            -NonInteractive), write a non-terminating error with the ErrorId
            DnsLathund.Confirm.NonInteractive and return $false, so an unattended
@@ -35,14 +38,16 @@
         Low, Medium or High; compared with $ConfirmPreference.
 
     .PARAMETER State
-        A hashtable created once per public command call (@{ All = $false }); it
-        carries "Yes to all" from one item to the next.
+        A hashtable created once per public command call (@{ All = @{} }, or the
+        Confirm entry of New-DnsBatch). State.All maps an impact level to $true once
+        the operator answered "Yes to all" at that level, and carries it from one
+        item to the next.
 
     .PARAMETER Force
         The public command's -Force: confirm without prompting.
 
     .EXAMPLE
-        $state = @{ All = $false }
+        $state = @{ All = @{} }
         if (Confirm-DnsAction -Target 'srv01.contoso.local' -Action 'Remove A record' -Impact High -State $state -Force:$Force) {
             # make the change
         }
@@ -76,7 +81,15 @@
         return $false
     }
 
-    if ($Force -or $State['All'] -eq $true) {
+    # Anything but a hashtable (a caller written for the old @{ All = $false }) means
+    # nothing has been approved yet.
+    $approvedImpacts = $State['All']
+    if ($approvedImpacts -isnot [hashtable]) {
+        $approvedImpacts = @{}
+        $State['All'] = $approvedImpacts
+    }
+
+    if ($Force -or $approvedImpacts[$Impact] -eq $true) {
         return $true
     }
 
@@ -105,7 +118,7 @@
             return $true
         }
         { $_ -eq 'a' -or $_ -eq 'all' } {
-            $State['All'] = $true
+            $approvedImpacts[$Impact] = $true
             return $true
         }
         { $_ -eq 's' -or $_ -eq 'stop' } {

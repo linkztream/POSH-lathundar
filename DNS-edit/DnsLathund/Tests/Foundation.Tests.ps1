@@ -56,7 +56,7 @@ BeforeAll {
 
 Describe 'Module foundation' {
     It 'imports as version 1.0.0' {
-        (Get-Module -Name DnsLathund).Version | Should -Be ([version]'1.0.0')
+        (Get-Module -Name DnsLathund).Version | Should -Be ([version]'1.1.0')
     }
 
     It 'exports only functions that exist in Public and are listed in the manifest' {
@@ -823,7 +823,7 @@ Describe 'Confirm-DnsAction' {
         InModuleScope DnsLathund {
             Mock Read-Host { 'y' }
             $WhatIfPreference = $true
-            $state = @{ All = $true }
+            $state = @{ All = @{ High = $true } }
 
             Confirm-DnsAction -Target 'srv01.contoso.local' -Action 'Remove A record' -Impact High -State $state -Force | Should -BeFalse
 
@@ -836,16 +836,16 @@ Describe 'Confirm-DnsAction' {
         InModuleScope DnsLathund {
             Mock Read-Host { 'n' }
             $ConfirmPreference = 'Low'
-            Confirm-DnsAction -Target 't' -Action 'a' -Impact High -State @{ All = $false } -Force | Should -BeTrue
+            Confirm-DnsAction -Target 't' -Action 'a' -Impact High -State @{ All = @{} } -Force | Should -BeTrue
             Should -Invoke Read-Host -Times 0 -Exactly
         }
     }
 
-    It 'rule 2: State.All returns $true without prompting' {
+    It 'rule 2: an earlier "Yes to all" at the same impact (State.All[Impact]) returns $true without prompting' {
         InModuleScope DnsLathund {
             Mock Read-Host { 'n' }
             $ConfirmPreference = 'Low'
-            Confirm-DnsAction -Target 't' -Action 'a' -Impact High -State @{ All = $true } | Should -BeTrue
+            Confirm-DnsAction -Target 't' -Action 'a' -Impact High -State @{ All = @{ High = $true } } | Should -BeTrue
             Should -Invoke Read-Host -Times 0 -Exactly
         }
     }
@@ -865,7 +865,7 @@ Describe 'Confirm-DnsAction' {
             Mock Read-Host { 'n' }
             $ConfirmPreference = $Preference
 
-            $result = Confirm-DnsAction -Target 't' -Action 'a' -Impact $Impact -State @{ All = $false }
+            $result = Confirm-DnsAction -Target 't' -Action 'a' -Impact $Impact -State @{ All = @{} }
 
             if ($Prompts) {
                 Should -Invoke Read-Host -Times 1 -Exactly
@@ -882,7 +882,7 @@ Describe 'Confirm-DnsAction' {
         InModuleScope DnsLathund {
             Mock Read-Host { 'y' }
             $ConfirmPreference = 'High'
-            Confirm-DnsAction -Target 'srv01.contoso.local' -Action 'Remove A record' -Impact High -State @{ All = $false } | Should -BeTrue
+            Confirm-DnsAction -Target 'srv01.contoso.local' -Action 'Remove A record' -Impact High -State @{ All = @{} } | Should -BeTrue
             Should -Invoke Read-Host -Times 1 -Exactly -ParameterFilter {
                 $Prompt -eq "Remove A record`n  srv01.contoso.local`n[Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N)"
             }
@@ -902,18 +902,18 @@ Describe 'Confirm-DnsAction' {
             $script:FoundationTestAnswer = $Answer
             Mock Read-Host { $script:FoundationTestAnswer }
             $ConfirmPreference = 'High'
-            Confirm-DnsAction -Target 't' -Action 'a' -Impact High -State @{ All = $false } | Should -Be $Expected
+            Confirm-DnsAction -Target 't' -Action 'a' -Impact High -State @{ All = @{} } | Should -Be $Expected
         }
     }
 
-    It 'rule 4: "a" sets State.All so later calls do not prompt' {
+    It 'rule 4: "a" sets State.All[Impact] so later calls at that impact do not prompt' {
         InModuleScope DnsLathund {
             Mock Read-Host { 'A' }
             $ConfirmPreference = 'High'
-            $state = @{ All = $false }
+            $state = @{ All = @{} }
 
             Confirm-DnsAction -Target 'first' -Action 'a' -Impact High -State $state | Should -BeTrue
-            $state.All | Should -BeTrue
+            $state.All['High'] | Should -BeTrue
             Confirm-DnsAction -Target 'second' -Action 'a' -Impact High -State $state | Should -BeTrue
 
             Should -Invoke Read-Host -Times 1 -Exactly
@@ -924,7 +924,7 @@ Describe 'Confirm-DnsAction' {
         InModuleScope DnsLathund {
             Mock Read-Host { 'stop' }
             $ConfirmPreference = 'High'
-            { Confirm-DnsAction -Target 't' -Action 'a' -Impact High -State @{ All = $false } } | Should -Throw 'Operation stopped by the operator.'
+            { Confirm-DnsAction -Target 't' -Action 'a' -Impact High -State @{ All = @{} } } | Should -Throw 'Operation stopped by the operator.'
         }
     }
 
@@ -933,7 +933,7 @@ Describe 'Confirm-DnsAction' {
             Mock Read-Host { throw 'PowerShell is in NonInteractive mode. Read and Prompt functionality is not available.' }
             $ConfirmPreference = 'High'
 
-            $result = Confirm-DnsAction -Target 'srv01' -Action 'a' -Impact High -State @{ All = $false } -ErrorVariable errors -ErrorAction SilentlyContinue
+            $result = Confirm-DnsAction -Target 'srv01' -Action 'a' -Impact High -State @{ All = @{} } -ErrorVariable errors -ErrorAction SilentlyContinue
 
             $result | Should -BeFalse
             # -ErrorVariable also collects the exception thrown by Read-Host and caught inside.
@@ -950,7 +950,7 @@ Describe 'Confirm-DnsAction' {
                 function Invoke-ConfirmProbe {
                     [CmdletBinding(SupportsShouldProcess)]
                     param ([string]$Impact = 'High')
-                    Confirm-DnsAction -Target 'srv01' -Action 'Remove A record' -Impact $Impact -State @{ All = $false }
+                    Confirm-DnsAction -Target 'srv01' -Action 'Remove A record' -Impact $Impact -State @{ All = @{} }
                 }
                 Mock Read-Host { 'n' }
                 $ConfirmPreference = 'Low'
@@ -965,7 +965,7 @@ Describe 'Confirm-DnsAction' {
                 function Invoke-ConfirmProbe {
                     [CmdletBinding(SupportsShouldProcess)]
                     param ([string]$Impact = 'High')
-                    Confirm-DnsAction -Target 'srv01' -Action 'Remove A record' -Impact $Impact -State @{ All = $false }
+                    Confirm-DnsAction -Target 'srv01' -Action 'Remove A record' -Impact $Impact -State @{ All = @{} }
                 }
                 Mock Read-Host { 'y' }
                 $ConfirmPreference = 'High'
@@ -980,7 +980,7 @@ Describe 'Confirm-DnsAction' {
                 function Invoke-ConfirmProbe {
                     [CmdletBinding(SupportsShouldProcess)]
                     param ([string]$Impact = 'High')
-                    Confirm-DnsAction -Target 'srv01' -Action 'Remove A record' -Impact $Impact -State @{ All = $false }
+                    Confirm-DnsAction -Target 'srv01' -Action 'Remove A record' -Impact $Impact -State @{ All = @{} }
                 }
                 Mock Read-Host { 'y' }
 
@@ -1057,7 +1057,7 @@ Describe 'Write-DnsChangeLog' {
 
         $record = $lines[0] | ConvertFrom-Json
         ($record.PSObject.Properties | ForEach-Object { $_.Name }) -join ',' |
-            Should -Be 'Id,BatchId,Timestamp,Operator,Server,Action,Zone,NodeName,Type,Before,After,Result,Error'
+            Should -Be 'Id,BatchId,Timestamp,Operator,Server,Action,Zone,NodeName,Name,Type,Data,Before,After,Result,Error'
         $record.Operator | Should -Not -BeNullOrEmpty
         $record.After | Should -BeNullOrEmpty
         $record.Error | Should -BeNullOrEmpty

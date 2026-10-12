@@ -139,6 +139,69 @@ try {
         throw 'dc01.contoso.local: ReferencedBy lacks SRV:_ldap._tcp.contoso.local.'
     }
     Write-Output 'Scenario: Get-DnsEntry checks passed.'
+
+    # --- Phase 2 scenarios (CONTRACTS §16) ---
+    # The change commands under -WhatIf against the same stub data: nothing may
+    # be written to the stub store, every Result must say WhatIf, and every
+    # Result must be one line in a change log inside the scenario root, so the
+    # operator's real log is never touched.
+    $scenarioLog = Join-Path -Path $scenarioRoot -ChildPath 'changes.jsonl'
+    $backupRoot = Join-Path -Path $scenarioRoot -ChildPath 'backup'
+
+    $previews = @(
+        @{ Label = 'Remove-DnsEntry'; Results = @(Remove-DnsEntry -Identity 'srv02.contoso.local' -Server $scenarioServer -LogPath $scenarioLog -WhatIf) }
+        @{ Label = 'New-DnsEntry'; Results = @(New-DnsEntry -Name 'new01.contoso.local' -Address '10.0.16.30' -Server $scenarioServer -LogPath $scenarioLog -WhatIf) }
+        @{ Label = 'Set-DnsEntry'; Results = @(Set-DnsEntry -Identity 'srv02.contoso.local' -TTL 300 -Server $scenarioServer -LogPath $scenarioLog -WhatIf) }
+        @{ Label = 'Backup-DnsZone'; Results = @(Backup-DnsZone -Server $scenarioServer -Path $backupRoot -LogPath $scenarioLog -WhatIf) }
+    )
+    $expectedLines = 0
+    foreach ($preview in $previews) {
+        $results = @($preview['Results'])
+        if ($results.Count -lt 1) {
+            throw ('{0} -WhatIf returned no Result.' -f $preview['Label'])
+        }
+        foreach ($result in $results) {
+            if ($result.Result -ne 'WhatIf') {
+                throw ('{0} -WhatIf returned Result {1} for {2} {3}; expected WhatIf.' -f $preview['Label'], $result.Result, $result.Action, $result.Name)
+            }
+            if (-not $result.BatchId -or -not $result.Name) {
+                throw ('{0} -WhatIf returned a Result without BatchId or Name.' -f $preview['Label'])
+            }
+            Write-Output ('Scenario: {0} -WhatIf -> {1} {2} {3} {4}' -f $preview['Label'], $result.Action, $result.Name, $result.Data, $result.Result)
+        }
+        $expectedLines = $expectedLines + $results.Count
+    }
+    if (@($previews[3]['Results']).Count -ne 2) {
+        throw ('Backup-DnsZone -WhatIf returned {0} Result(s); expected one per exportable zone (2).' -f @($previews[3]['Results']).Count)
+    }
+
+    # Nothing may have changed, and every Result must be exactly one log line.
+    $srv02After = @(Get-DnsEntry -Find 'srv02.contoso.local' -Server $scenarioServer)
+    if ($srv02After.Count -ne 1 -or $srv02After[0].Data -ne '10.0.16.20') {
+        throw 'srv02.contoso.local changed under -WhatIf.'
+    }
+    $new01After = @(Get-DnsEntry -Find 'new01.contoso.local' -Server $scenarioServer)
+    if ($new01After.Count -ne 0) {
+        throw 'new01.contoso.local was created under -WhatIf.'
+    }
+    if (Test-Path -LiteralPath $backupRoot) {
+        throw 'Backup-DnsZone -WhatIf created the backup folder.'
+    }
+    if (-not (Test-Path -LiteralPath $scenarioLog -PathType Leaf)) {
+        throw 'The -WhatIf runs wrote no change log.'
+    }
+    $logLines = @(Get-Content -LiteralPath $scenarioLog -Encoding UTF8)
+    if ($logLines.Count -ne $expectedLines) {
+        throw ('The change log has {0} line(s); expected {1} (one per Result).' -f $logLines.Count, $expectedLines)
+    }
+    foreach ($line in $logLines) {
+        $entry = ConvertFrom-Json -InputObject $line
+        if ($entry.Result -ne 'WhatIf' -or -not $entry.Name -or -not $entry.BatchId -or -not $entry.Action) {
+            throw ('Unexpected change-log line: {0}' -f $line)
+        }
+    }
+    Write-Output ('Scenario: phase 2 -WhatIf checks passed ({0} Result(s), {0} log line(s)).' -f $expectedLines)
+    # --- End of phase 2 scenarios ---
 }
 finally {
     & $dnsLathund {

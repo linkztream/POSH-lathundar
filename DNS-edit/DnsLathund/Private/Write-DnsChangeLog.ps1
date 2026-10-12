@@ -6,8 +6,8 @@
     .DESCRIPTION
         Writes exactly one line of compact JSON per call. Every line has the same
         keys in the same order - Id, BatchId, Timestamp, Operator, Server, Action,
-        Zone, NodeName, Type, Before, After, Result, Error - with null for anything
-        the entry does not supply, so the log can be read with
+        Zone, NodeName, Name, Type, Data, Before, After, Result, Error - with null
+        for anything the entry does not supply, so the log can be read with
         Get-Content -Encoding UTF8 <file> | ConvertFrom-Json. Keys outside the schema
         are appended after Error. Id defaults to a new GUID, Timestamp to now and
         Operator to DOMAIN\user. Dates are written in round-trip format
@@ -23,14 +23,16 @@
         the path and the reason. This function never throws.
 
     .PARAMETER Entry
-        The change record. Keys as in the schema above; Before and After are
+        The change record. Keys as in the schema above; Name is the owner FQDN and
+        Data the address or target the change is about, so a line without Before
+        and After (WhatIf, Failed) still names its record. Before and After are
         hashtables such as @{ Data = '10.0.16.5'; Ttl = 3600; Timestamp = $null; IsStatic = $true }.
 
     .PARAMETER LogPath
         The log file. Overrides the environment variable and the default.
 
     .EXAMPLE
-        Write-DnsChangeLog -Entry @{ BatchId = $batchId; Server = 'dc01'; Action = 'RemoveA'; Zone = 'contoso.local'; NodeName = 'srv01'; Type = 'A'; Result = 'Success' }
+        Write-DnsChangeLog -Entry @{ BatchId = $batchId; Server = 'dc01'; Action = 'RemoveA'; Zone = 'contoso.local'; NodeName = 'srv01'; Name = 'srv01.contoso.local'; Type = 'A'; Data = '10.0.16.5'; Result = 'Success' }
 
         Appends one line to this month's default log file.
     #>
@@ -70,7 +72,7 @@
 
         # Membership is checked on a hashtable: Windows PowerShell 5.1 blocks method
         # calls on [ordered] dictionaries in Constrained Language Mode.
-        $schemaKeys = @('Id', 'BatchId', 'Timestamp', 'Operator', 'Server', 'Action', 'Zone', 'NodeName', 'Type', 'Before', 'After', 'Result', 'Error')
+        $schemaKeys = @('Id', 'BatchId', 'Timestamp', 'Operator', 'Server', 'Action', 'Zone', 'NodeName', 'Name', 'Type', 'Data', 'Before', 'After', 'Result', 'Error')
         $isSchemaKey = @{}
         $record = [ordered]@{}
         foreach ($key in $schemaKeys) {

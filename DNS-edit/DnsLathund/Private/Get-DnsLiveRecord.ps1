@@ -127,7 +127,13 @@
             }
             else {
                 $records = @()
-                Write-Error -Message ("Lookup of '{0}' ({1}) in zone '{2}' on '{3}' failed: {4}" -f $NodeName, $recordType, $zone, $serverName, $lookupError.Exception.Message) -Category $category -ErrorId 'DnsLathund.Get-DnsLiveRecord.LookupFailed' -TargetObject $NodeName
+                # An unreachable server arrives as NotSpecified / 'WIN32 1722' (measured 2026-10-11);
+                # ConnectionError lets a change command end its batch (CONTRACTS.md 5.8).
+                $errorCategory = $category
+                if (Test-DnsConnectionError -ErrorRecord $lookupError) {
+                    $errorCategory = 'ConnectionError'
+                }
+                Write-Error -Message ("Lookup of '{0}' ({1}) in zone '{2}' on '{3}' failed: {4}" -f $NodeName, $recordType, $zone, $serverName, $lookupError.Exception.Message) -Category $errorCategory -ErrorId 'DnsLathund.Get-DnsLiveRecord.LookupFailed' -TargetObject $NodeName
             }
         }
 

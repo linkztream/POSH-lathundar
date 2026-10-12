@@ -877,13 +877,18 @@ Describe 'Get-DnsLiveRecord' {
         }
     }
 
-    It 'reports any other failure as a non-terminating LookupFailed error with the original category' -TestCases @(
-        @{ Category = 'ConnectionError'; UseMock = $false }
-        @{ Category = 'PermissionDenied'; UseMock = $true }
+    It 'reports any other failure as a non-terminating LookupFailed error with the original category (<Category> -> <Expected>)' -TestCases @(
+        @{ Category = 'ConnectionError'; UseMock = $false; Expected = 'ConnectionError' }
+        @{ Category = 'PermissionDenied'; UseMock = $true; Expected = 'PermissionDenied' }
+        # The real provider reports an unreachable server as NotSpecified with WIN32 1722 (measured 2026-10-11).
+        @{ Category = 'NotSpecified'; UseMock = $true; Expected = 'ConnectionError' }
     ) {
-        InModuleScope DnsLathund -Parameters @{ UseMock = $UseMock } {
-            param ($UseMock)
-            if ($UseMock) {
+        InModuleScope DnsLathund -Parameters @{ UseMock = $UseMock; Category = $Category; Expected = $Expected } {
+            param ($UseMock, $Category, $Expected)
+            if ($UseMock -and $Category -eq 'NotSpecified') {
+                Mock Get-DnsServerResourceRecord { Write-Error -Message 'Failed to get the zone information for contoso.local on server dc01.' -Category NotSpecified -ErrorId 'WIN32 1722,Get-DnsServerResourceRecord' }
+            }
+            elseif ($UseMock) {
                 Mock Get-DnsServerResourceRecord { Write-Error -Message 'Access is denied.' -Category PermissionDenied -ErrorId 'WIN32 5,Get-DnsServerResourceRecord' }
             }
             else {
@@ -902,6 +907,7 @@ Describe 'Get-DnsLiveRecord' {
                 $record | Should -BeOfType [System.Management.Automation.ErrorRecord]
                 $record.FullyQualifiedErrorId | Should -BeLike 'DnsLathund.Get-DnsLiveRecord.LookupFailed*'
                 $record.TargetObject | Should -Be 'srv01'
+                $record.CategoryInfo.Category | Should -Be $Expected
             }
             "$($records[0])" | Should -BeLike "Lookup of 'srv01' (A) in zone 'contoso.local' on 'dc01' failed: *"
             "$($records[1])" | Should -BeLike "Lookup of 'srv01' (AAAA) in zone 'contoso.local' on 'dc01' failed: *"

@@ -1,6 +1,6 @@
 ﻿@{
     RootModule           = 'DnsLathund.psm1'
-    ModuleVersion        = '1.0.0'
+    ModuleVersion        = '1.1.0'
     GUID                 = 'a470d7fe-af54-4636-b760-f36627b1214d'
     Author               = 'Pär Lindström'
     CompanyName          = 'Unknown'
@@ -13,7 +13,7 @@
     # that the module can be imported, and tested with stubs, on machines without RSAT.
     FormatsToProcess     = @('DnsLathund.Format.ps1xml')
 
-    FunctionsToExport    = @('Get-DnsEntry', 'Get-DnsSnapshot', 'Update-DnsSnapshot')
+    FunctionsToExport    = @('Get-DnsEntry', 'Get-DnsSnapshot', 'Update-DnsSnapshot', 'Remove-DnsEntry', 'New-DnsEntry', 'Set-DnsEntry', 'New-DnsReverseZone', 'Backup-DnsZone')
     CmdletsToExport      = @()
     VariablesToExport    = @()
     AliasesToExport      = @()
@@ -21,7 +21,7 @@
     PrivateData          = @{
         PSData = @{
             Tags         = @('DNS', 'DnsServer', 'ActiveDirectory', 'PTR', 'ReverseLookup', 'Audit', 'ConstrainedLanguage', 'Windows')
-            ReleaseNotes = 'Phase 1: module foundation, zone table, zone snapshots and Get-DnsEntry.'
+            ReleaseNotes = 'Phase 2: Remove-DnsEntry, New-DnsEntry, Set-DnsEntry, New-DnsReverseZone and Backup-DnsZone with the change log. Phase 1: module foundation, zone table, zone snapshots and Get-DnsEntry.'
         }
     }
 }

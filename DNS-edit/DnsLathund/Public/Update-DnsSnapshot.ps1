@@ -163,7 +163,7 @@
         [switch]$Force
     )
 
-    $state = @{ All = $false }
+    $state = @{ All = @{} }
     $serverKey = Resolve-DnsServerName -Server $Server
 
     # A fresh zone list, so that zones created or removed since the module

@@ -7,6 +7,7 @@ $script:ZoneTableCache         = @{}
 $script:CimSessionCache        = @{}
 $script:SnapshotIndexCache     = @{}
 $script:DnsServerModuleChecked = $false
+$script:WriterServer           = $null   # server that received this session's first change (Test-DnsWriterServer, CONTRACTS.md 7.1 and 13.9)
 
 # Where Export-DnsServerZone drops its file on the DNS server. Read when the server is
 # this machine; tests point it at TestDrive together with the stub export root.

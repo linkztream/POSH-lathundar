@@ -5,7 +5,7 @@
 .DESCRIPTION
     Enforces CONTRACTS §4.1 and §16. Every *.ps1 under Private\ and Public\
     plus DnsLathund.psm1 is parsed with the PowerShell parser (this test runs
-    in Full language, so .NET is fine here) and checked against thirteen rules.
+    in Full language, so .NET is fine here) and checked against fourteen rules.
     Each rule is its own It, so a failure names the rule, the file and the
     line.
 
@@ -25,13 +25,14 @@ BeforeDiscovery {
         @{ Number = '04'; Function = 'Find-ClmRule04Violation'; Title = 'no static method calls on types outside the allow-list' }
         @{ Number = '05'; Function = 'Find-ClmRule05Violation'; Title = 'no new/Invoke/InvokeReturnAsIs/Create/TryParse/GetNewClosure/TypeNames.Insert/GetUnresolvedProviderPathFromPSPath calls' }
         @{ Number = '06'; Function = 'Find-ClmRule06Violation'; Title = 'no New-Object except PSObject, no -ComObject, Add-Type, Invoke-Expression or Set-Variable -Scope Global' }
-        @{ Number = '07'; Function = 'Find-ClmRule07Violation'; Title = 'internal file writes and zone exports carry -WhatIf:$false and -Confirm:$false' }
+        @{ Number = '07'; Function = 'Find-ClmRule07Violation'; Title = 'internal file writes, zone exports and DnsServer write cmdlets carry -WhatIf:$false and -Confirm:$false' }
         @{ Number = '08'; Function = 'Find-ClmRule08Violation'; Title = 'no += on a variable, index or member inside a loop, ForEach-Object/Where-Object or .ForEach()/.Where() (numeric constant counters excepted)' }
         @{ Number = '09'; Function = 'Find-ClmRule09Violation'; Title = 'no class/enum definitions and no using statements' }
         @{ Number = '10'; Function = 'Find-ClmRule10Violation'; Title = 'no Write-Host outside Private\Confirm-DnsAction.ps1' }
         @{ Number = '11'; Function = 'Find-ClmRule11Violation'; Title = 'no Read-Host outside Private\Confirm-DnsAction.ps1' }
         @{ Number = '12'; Function = 'Find-ClmRule12Violation'; Title = 'no CIM type literals (Microsoft.Management.Infrastructure.*) and no ErrorCategory type names' }
         @{ Number = '13'; Function = 'Find-ClmRule13Violation'; Title = 'no ForEach-Object member-name form (first positional argument must be a script block; no -MemberName)' }
+        @{ Number = '14'; Function = 'Find-ClmRule14Violation'; Title = 'no .Clone() calls and no [ciminstance]::new (fetch the record twice instead)' }
     )
 
     $snippetPath = 'Public\Test-ClmSnippet.ps1'
@@ -124,6 +125,15 @@ BeforeDiscovery {
         @{ Number = '07'; Path = $snippetPath; Snippet = 'Remove-Item -LiteralPath $p -WhatIf:$false -Confirm' }
         @{ Number = '07'; Path = $snippetPath; Snippet = 'New-Item -Path $p -ItemType File -wi:$false -Confirm:$false' }
         @{ Number = '07'; Path = $snippetPath; Snippet = 'Export-DnsServerZone -Name $zone -FileName $file -WhatIf:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerResourceRecordA -ZoneName $zone -Name $node -IPv4Address $address' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerResourceRecordAAAA @server -ZoneName $zone -Name $node -IPv6Address $address -WhatIf:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerResourceRecordCName -ZoneName $zone -Name $node -HostNameAlias $target -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerResourceRecordPtr -ZoneName $zone -Name $node -PtrDomainName $target -WhatIf:$true -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = '$records | Remove-DnsServerResourceRecord -ZoneName $zone -Force' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Set-DnsServerResourceRecord -ZoneName $zone -OldInputObject $old -NewInputObject $new -WhatIf:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerPrimaryZone -NetworkId $networkId -ReplicationScope Custom -DirectoryPartitionName $partition' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Set-DnsServerZoneAging -Name $zone -Aging $true -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'DnsServer\Remove-DnsServerResourceRecord -ZoneName $zone -InputObject $record -Force' }
 
         @{ Number = '08'; Path = $snippetPath; Snippet = 'foreach ($i in 1..3) { $a += $i }' }
         @{ Number = '08'; Path = $snippetPath; Snippet = 'for ($i = 0; $i -lt 3; $i++) { $a += ''x'' }' }
@@ -161,6 +171,13 @@ BeforeDiscovery {
         @{ Number = '13'; Path = $snippetPath; Snippet = '$names = $items | foreach ''Name''' }
         @{ Number = '13'; Path = $snippetPath; Snippet = '$names = $items | Microsoft.PowerShell.Core\ForEach-Object Name' }
         @{ Number = '13'; Path = $snippetPath; Snippet = '$out = $items | ForEach-Object $scriptBlock' }
+
+        @{ Number = '14'; Path = $snippetPath; Snippet = '$new = $old.Clone()' }
+        @{ Number = '14'; Path = $snippetPath; Snippet = '$new = ($records[0]).clone()' }
+        @{ Number = '14'; Path = $snippetPath; Snippet = '$copy = $record.RecordData.Clone()' }
+        @{ Number = '14'; Path = $snippetPath; Snippet = '$new = [ciminstance]::new($old)' }
+        @{ Number = '14'; Path = $snippetPath; Snippet = '$new = [Microsoft.Management.Infrastructure.CimInstance]::new($old)' }
+        @{ Number = '14'; Path = $snippetPath; Snippet = '$new = [CimInstance]::new(''MicrosoftDNS_AType'')' }
 
         @{ Number = '09'; Path = $snippetPath; Snippet = 'class Foo { [string]$Name }' }
         @{ Number = '09'; Path = $snippetPath; Snippet = 'enum Color { Red; Green }' }
@@ -216,6 +233,15 @@ BeforeDiscovery {
         @{ Number = '07'; Path = $snippetPath; Snippet = 'Set-Content -Path $p -Value ''x'' -Encoding UTF8 -WhatIf:$false -Confirm:$false' }
         @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-Content -Path $p -Value $line -WhatIf:$false -Confirm:$false' }
         @{ Number = '07'; Path = $snippetPath; Snippet = 'Export-DnsServerZone -Name $zone -FileName $file -WhatIf:$false -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerResourceRecordA @server @optional -ZoneName $zone -Name $node -IPv4Address $address -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerResourceRecordAAAA -ZoneName $zone -Name $node -IPv6Address $address -WhatIf:$false -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerResourceRecordCName -ZoneName $zone -Name $node -HostNameAlias $target -WhatIf:$false -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerResourceRecordPtr -ZoneName $zone -Name $node -PtrDomainName $target -WhatIf:$false -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = '$records | Remove-DnsServerResourceRecord @server -ZoneName $zone -Force -WhatIf:$false -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Set-DnsServerResourceRecord -ZoneName $zone -OldInputObject $old -NewInputObject $new -WhatIf:$false -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Add-DnsServerPrimaryZone -NetworkId $networkId -ReplicationScope Domain -WhatIf:$false -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = 'Set-DnsServerZoneAging -Name $zone -Aging $true -WhatIf:$false -Confirm:$false' }
+        @{ Number = '07'; Path = $snippetPath; Snippet = '$records = Get-DnsServerResourceRecord -ZoneName $zone -Name $node -Node -RRType A' }
         @{ Number = '07'; Path = $snippetPath; Snippet = '$text = Get-Content -Path $p -Raw' }
 
         @{ Number = '08'; Path = $snippetPath; Snippet = 'foreach ($i in 1..3) { $count += 1; $h[$k] += 2; $bytes += 1.5 }' }
@@ -246,6 +272,10 @@ BeforeDiscovery {
         @{ Number = '13'; Path = $snippetPath; Snippet = '$total = $items | % { $n = 0 } { $n++ } { $n }' }
         @{ Number = '13'; Path = $snippetPath; Snippet = '$names = $items | ForEach-Object -ErrorAction Stop { $_.Name }' }
         @{ Number = '13'; Path = $snippetPath; Snippet = 'foreach ($item in $items) { $item.Name }' }
+
+        @{ Number = '14'; Path = $snippetPath; Snippet = '$old = Get-DnsServerResourceRecord @p -Node; $new = Get-DnsServerResourceRecord @p -Node' }
+        @{ Number = '14'; Path = $snippetPath; Snippet = '$h = @{ Clone = 1 }; $v = $h.Clone; $s = ''Clone''' }
+        @{ Number = '14'; Path = $snippetPath; Snippet = '$t = New-TimeSpan -Seconds 60; $g = [guid]::NewGuid()' }
     )
 }
 
@@ -317,10 +347,16 @@ BeforeAll {
         'new', 'Invoke', 'InvokeReturnAsIs', 'Create', 'TryParse', 'GetNewClosure', 'GetUnresolvedProviderPathFromPSPath'
     )
 
-    # Rule 7.
+    # Rule 7. From phase 2 the DnsServer write cmdlets too: the caller's -WhatIf
+    # must stop at Confirm-DnsAction, never reach the server cmdlet by dynamic scoping.
     $script:ClmInternalWriteCommands = @(
-        'Add-Content', 'Set-Content', 'Out-File', 'Copy-Item', 'Move-Item', 'Remove-Item', 'New-Item', 'Export-DnsServerZone'
+        'Add-Content', 'Set-Content', 'Out-File', 'Copy-Item', 'Move-Item', 'Remove-Item', 'New-Item', 'Export-DnsServerZone',
+        'Add-DnsServerResourceRecordA', 'Add-DnsServerResourceRecordAAAA', 'Add-DnsServerResourceRecordCName', 'Add-DnsServerResourceRecordPtr',
+        'Remove-DnsServerResourceRecord', 'Set-DnsServerResourceRecord', 'Add-DnsServerPrimaryZone', 'Set-DnsServerZoneAging'
     )
+
+    # Rule 14.
+    $script:ClmCimInstancePattern = '^(Microsoft\.Management\.Infrastructure\.)?CimInstance$'
 
     # Rules 10 and 11.
     $script:ClmConfirmFilePattern = '(^|[\\/])Private[\\/]Confirm-DnsAction\.ps1$'
@@ -988,6 +1024,37 @@ BeforeAll {
             if ($bound.Positional.Count -gt 0 -and
                 $bound.Positional[0] -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
                 ConvertTo-ClmViolation -Rule '13' -Path $Path -Ast $command -Message "ForEach-Object with positional argument $($bound.Positional[0].Extent.Text); use a script block"
+            }
+        }
+    }
+
+    # Rule 14: .Clone() (blocked in CLM on CIM instances, missing on PowerShell 7)
+    # and [ciminstance]::new. Set-DnsLiveRecord fetches the record twice instead.
+    # Member names are case-insensitive in PowerShell, so .clone() counts too.
+    function Find-ClmRule14Violation {
+        param ([System.Management.Automation.Language.Ast]$Ast, [string]$Path)
+
+        foreach ($node in (Find-ClmAst -Ast $Ast -Type ([System.Management.Automation.Language.InvokeMemberExpressionAst]))) {
+            $memberName = Get-ClmMemberName -MemberExpression $node
+            if ($null -eq $memberName) {
+                continue
+            }
+
+            if ($memberName -eq 'Clone') {
+                ConvertTo-ClmViolation -Rule '14' -Path $Path -Ast $node -Message '.Clone(); fetch the record twice with Get-DnsServerResourceRecord -Node instead'
+                continue
+            }
+
+            if ($memberName -eq 'new' -and $node.Static -and $node.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
+                $typeName = $node.Expression.TypeName.FullName
+                $resolvedName = ''
+                $resolved = $typeName -as [type]
+                if ($null -ne $resolved) {
+                    $resolvedName = $resolved.FullName
+                }
+                if ($typeName -match $script:ClmCimInstancePattern -or $resolvedName -eq 'Microsoft.Management.Infrastructure.CimInstance') {
+                    ConvertTo-ClmViolation -Rule '14' -Path $Path -Ast $node -Message "[$typeName]::new(); fetch the record twice with Get-DnsServerResourceRecord -Node instead"
+                }
             }
         }
     }

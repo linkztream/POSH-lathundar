@@ -150,6 +150,8 @@ file under `Private\` and `Public\` and the psm1.
 | `ForEach-Object <MemberName>` / `% Property` (the string member form) | Prompts for confirmation under 5.1 CLM | `ForEach-Object { $_.Property }` |
 | `$ExecutionContext.SessionState.Module.OnRemove = {}` without try/catch | Property set on a non-core type fails in CLM | Wrap in try/catch; under CLM cached CIM sessions close with the process |
 | `$hashtable.MissingKey` / `$null.Count` under strict mode | Throws under `Set-StrictMode -Version Latest` | `$hashtable['Key']` (returns `$null`), `@($x).Count` |
+| `$cimInstance.Clone()`, `[ciminstance]::new($x)` | Method/ctor on a non-core type; `.Clone()` is also missing on PowerShell 7 | Fetch the record twice (two independent `Get-DnsServerResourceRecord -Node` calls) and set properties on the second copy (§7.5 `Set-DnsLiveRecord`); lint rule 14 |
+| Assigning an `[ipaddress]` into `RecordData.IPv4Address` / `IPv6Address` | The CIM property type is `string` | Assign the normalised string |
 
 ### 4.2 Allowed and relied upon
 
@@ -206,7 +208,9 @@ branch on it (phase 4: `-IncludeOwner`). Phase 1 code never branches on it.
    error: a `FullyQualifiedErrorId` containing `9714`
    (DNS_ERROR_NAME_DOES_NOT_EXIST) or category `ObjectNotFound` means "no
    record" (no output, no error, one Verbose line); anything else becomes a
-   non-terminating `Write-Error` with the original category and ErrorId
+   non-terminating `Write-Error` with the original category (replaced by
+   `ConnectionError` when `Test-DnsConnectionError` recognises the error, so
+   change commands can end the batch per §5.8; added 2026-10-11) and ErrorId
    `DnsLathund.Get-DnsLiveRecord.LookupFailed`, and the lookup yields
    nothing. Measured 2026-10-09: `-ErrorAction Stop` + catch multiplies the
    records that reach a caller's `-ErrorVariable` (35 instead of 5 for one
@@ -225,6 +229,16 @@ branch on it (phase 4: `-IncludeOwner`). Phase 1 code never branches on it.
 7. **Output objects** are emitted as they are produced (streamed), never
    collected into an array first. `Get-DnsEntry -Find '*'` on a 550k zone
    must start emitting within seconds.
+8. **Batch abort (change commands).** The first
+   `DnsLathund.Confirm.NonInteractive` error, or an unreachable server (RPC
+   1722, WinRM/CIM transport failure), ends the batch with one terminating
+   error; it is never repeated per item. Access denied (Win32 error 5) on a
+   write is a per-item `Failed`, never `AlreadyDone`.
+9. **Idempotency.** `AlreadyDone` is a success: the wanted state already
+   holds (record already gone, record already present with the same data,
+   value already set, zone already hosted). `Skipped` carries its reason in
+   `Error` (referenced name, dynamic record, read-only zone, reference check
+   unavailable).
 
 ---
 
@@ -235,12 +249,14 @@ branch on it (phase 4: `-IncludeOwner`). Phase 1 code never branches on it.
 | `-Server` | `[string[]]` on `Get-*`, `[string]` on everything else; alias `ComputerName` | DNS server(s) to talk to. Default: `$env:LOGONSERVER` with leading `\\` removed. If that is empty, the parameter is effectively mandatory: throw `"No default DNS server (LOGONSERVER is not set). Specify -Server."` Resolved value is written to Verbose. |
 | `-Credential` | `[pscredential]`, attribute `[System.Management.Automation.Credential()]`, `[AllowNull()]` | Alternate credentials. DnsServer cmdlets lack `-Credential`, so when it is given **every** DnsServer call goes through a CIM session (`Get-DnsServerParameter`). If no session can be opened the call **throws**. Never fall back to the logged-on user silently. |
 | `-TimeoutSec` | `[int]`, default 300 | Operation timeout for CIM queries and remote commands where the underlying cmdlet supports it. |
-| `-LogPath` | `[string]` | Change-log file (§11). Phase 1 commands accept it only where they log (none do in phase 1 except reserved for `-IncludeOwner` in phase 4); do not add it to `Get-DnsEntry` yet. |
-| `-WhatIf` / `-Confirm` / `-Force` | via `SupportsShouldProcess` + `[switch]$Force` | On commands that change state (phase 2+). Phase 1 public commands do not change DNS, so they do not declare `SupportsShouldProcess`. `Update-DnsSnapshot` writes local files only; it declares `SupportsShouldProcess` and uses `Confirm-DnsAction` with impact `Low` for the export. |
+| `-LogPath` | `[string]` | Change-log file (§11). On every command that writes: `Remove-DnsEntry`, `New-DnsEntry`, `Set-DnsEntry`, `New-DnsReverseZone`, `Backup-DnsZone`. Not on `Get-DnsEntry` (reserved for `-IncludeOwner`, phase 4). |
+| `-WhatIf` / `-Confirm` / `-Force` | via `SupportsShouldProcess` + `[switch]$Force` | On every command that changes state. `-Force` means **zero prompts** (§10 rule 2) and nothing else; safety overrides have their own switches (`-AllowReferenced`, `-IncludeDynamic`, `-ReplacePtr`, `-SkipReferenceCheck`). `Get-DnsEntry` and `Get-DnsSnapshot` do not declare `SupportsShouldProcess`. `Update-DnsSnapshot` writes local files only, impact `Low`. |
+| `-Delay` | `[int]` seconds, default 0 | `Remove-DnsEntry`, `New-DnsEntry`, `Set-DnsEntry`: `Start-Sleep -Seconds` once per input item after its sub-operations (not per write). Whole seconds, like `Restart-Computer -Delay`. |
+| Aliases for established names | | `-Server` ← `ComputerName`; `-Zone` ← `ZoneName`; `-TTL` ← `TimeToLive`; `-InputFile` ← `FilePath`; `Backup-DnsZone -Path` ← `BackupPath`; `Get-DnsEntry -Find` ← `Name`, `Identity`, `HostName`, `IPAddress`, `Address`. See the naming rules in §3. |
 
 ---
 
-## 7. Module state and shared helpers (phase 1)
+## 7. Module state and shared helpers
 
 ### 7.1 Script-scope state (initialised in the psm1)
 
@@ -251,6 +267,7 @@ $script:ZoneTableCache      = @{}   # key: server (lower-case) -> zone table obj
 $script:CimSessionCache     = @{}   # key: server (lower-case) -> CimSession or 'Unavailable'
 $script:SnapshotIndexCache  = @{}   # key: server (lower-case) -> index hashtable (§9.3)
 $script:DnsServerModuleChecked = $false
+$script:WriterServer        = $null # server that received this session's first change (§7.5 Test-DnsWriterServer, §13.9)
 ```
 
 `$ExecutionContext.SessionState.Module.OnRemove` closes cached CIM sessions
@@ -304,6 +321,110 @@ Find-DnsZoneForName -Name <string> -ZoneTable <object> [-Reverse]
 ```
 `Find-DnsZoneForName` strips labels from the left and probes
 `$ZoneTable.ZoneLookup` (hashtable) – O(labels), no `Where-Object`/`Sort-Object`.
+
+### 7.5 Write helpers (phase 2)
+
+Write helpers take `-ServerParameter <hashtable>` from `Get-DnsServerParameter`
+unless stated. They never prompt, never log and never emit objects: the
+public command does that through `Confirm-DnsAction` (§10) and
+`Write-DnsResult`. Every DnsServer write cmdlet call carries
+`-WhatIf:$false -Confirm:$false` (lint rule 7, §16).
+
+```powershell
+New-DnsBatch -Server <string> [-LogPath <string>] [-Delay <int>] [-Force]
+# -> @{ BatchId=<guid string>; Server; LogPath; Delay; Force=[bool]; Confirm=@{ All=@{} }; StartedAt=[datetime]; References=@{}; CimSession=$null; Counts=@{} }
+# Created once in begin {} of every change command. Confirm is the -State hashtable for Confirm-DnsAction (§10).
+
+Write-DnsResult -Batch <hashtable> -Action <string> -Name <string> -Type <string> -Data <string> -Zone <string> -NodeName <string> -Result <string> [-ErrorMessage <string>] [-Before <hashtable>] [-After <hashtable>]
+# -> DnsLathund.Result (§12.2). Also writes exactly one change-log line (§11) with Id, BatchId, Server, Operator, Timestamp, Name and Data filled in.
+# -ErrorMessage has the alias -Error (a parameter named Error would shadow $Error). Empty strings for Type, Data, Zone, NodeName and the error text become $null.
+# Before/After: @{ Data; Ttl; Timestamp; IsStatic } or $null; only those four keys reach the log, IsStatic defaults to ($null -eq Timestamp).
+# Action and Result are validated against §12.2. Every Result value is counted in $Batch.Counts[<Result>]. The ONLY way module code creates a Result object or a log line.
+
+Read-DnsInputFile -Path <string> [-Csv]
+# -> string[] (trimmed lines; '#' comments and blank lines skipped; duplicates removed, case-insensitive), or
+#    hashtable[] with keys Name, Address, Target, TTL, Zone ($null when absent; TTL stays a string, the caller converts) with -Csv or when the
+#    first line that is neither blank nor a '#' comment has a field named 'Name' (a lone Name line counts, so Export-Csv output is recognised).
+# Delimiter ',' or ';' when the header has semicolons and no comma (Swedish Excel). CSV rows are not de-duplicated.
+# Get-Content -Encoding UTF8 (BOM-less files read as UTF-8 too). Missing or empty file -> throw. Unknown CSV columns -> one warning, ignored.
+
+Get-DnsReferenceTable -Zone <string> -CimSession <object> [-TimeoutSec <int>]
+# -> @{ Cname=@{ target -> @(owner) }; Srv=@{}; Ns=@{}; Mx=@{} } or $null when any query fails (no session, access denied, timeout -> one Verbose line).
+# Four Get-CimInstance -CimSession -Namespace root\MicrosoftDNS -OperationTimeoutSec calls:
+#   SELECT OwnerName, <prop> FROM MicrosoftDNS_<CNAME|SRV|NS|MX>Type WHERE ContainerName='<zone>'
+# <prop> = PrimaryName | SRVDomainName | NSHost | MailExchange. Values carry a trailing dot (verified 2026-10-11) -> ConvertTo-DnsNormalizedName. OwnerName has no dot.
+
+Get-DnsReference -Name <string> -ZoneTable <object> -Batch <hashtable> [-Credential] [-TimeoutSec <int>] [-MaxSnapshotAge <timespan>] [-SkipReferenceCheck]
+# -> @{ Cname=[string[]]; Srv=[string[]]; Ns=[string[]]; Mx=[string[]]; Source='Snapshot'|'Wql'|'Skipped'|'Unavailable'; Age=[timespan]|$null }
+# Source order: (1) $script:SnapshotIndexCache[server], or a snapshot on disk whose OldestExportedAt is younger than -MaxSnapshotAge (default 24 h) — checked with
+#   Get-DnsSnapshotMeta and loaded with Get-DnsSnapshotIndex only when the age check passed (never the auto-export path) -> RefBy index.
+# (2) otherwise WQL: one CIM session per batch ($Batch.CimSession from Get-DnsCimSession; $null -> Unavailable); Get-DnsReferenceTable for EVERY hosted
+#   forward zone (SRV/NS/MX may live in another zone than the name), cached in $Batch.References[zone]; any table $null -> Unavailable.
+# (3) -SkipReferenceCheck -> Source='Skipped', empty lists, one warning per batch (counted in $Batch.Counts['ReferenceCheckSkipped']).
+# The age limit applies to the cached index too; the disk is probed only when nothing is cached for the server. Every hosted forward zone is queried
+# (secondary, stub and forwarder zones included); a zone whose table failed stays $null in $Batch.References for the rest of the batch.
+# Owners are DISTINCT FQDNs (a count in a message counts owners, not records); 'Skipped' and 'Unavailable' return empty lists. The caller decides the consequence (§13.4).
+
+Remove-DnsLiveRecord -ServerParameter <hashtable> -ZoneName <string> -NodeName <string> -RRType <string> -Data <string>
+# -> @{ Removed=[bool]; AlreadyGone=[bool]; Error=<string>|$null; ErrorId=<FullyQualifiedErrorId>|$null; Unreachable=[bool] }
+# Get-DnsServerResourceRecord -Node -RRType, keep the record whose normalised Data equals -Data, pipe it to
+# Remove-DnsServerResourceRecord -ZoneName -Force -WhatIf:$false -Confirm:$false. Pipeline form ONLY: the -Name/-RRType/-RecordData form
+# removes the record but reports a false error on Server 2022/2025. No matching record, or 9701 / 9714 from the cmdlet -> AlreadyGone.
+# Unreachable = Test-DnsConnectionError on the failing error record (§13.9: the caller ends the batch).
+
+Add-DnsLiveRecord -ServerParameter <hashtable> -ZoneName <string> -NodeName <string> -RRType <A|AAAA|CNAME|PTR> -Data <string> [-Ttl <int>]
+# -> @{ Record=<hashtable from Get-DnsLiveRecord>|$null; Reason='Added'|'AlreadyExists'|'CnameConflict'|'Failed'; Error; ErrorId; Unreachable=[bool] }
+# Typed cmdlets only (Add-DnsServerResourceRecordA/AAAA/CName/Ptr), -TimeToLive (New-TimeSpan -Seconds $Ttl) only when -Ttl is given,
+# never -CreatePtr, never -AgeRecord (records are static). Throws when -NodeName ends with -ZoneName (the cmdlet would create x.zone.zone).
+# Re-reads the record after the add. FullyQualifiedErrorId (winerror.h, §13.9): 9711 -> AlreadyExists (Record = the existing record);
+# 9708 or 9709 -> CnameConflict; anything else -> Failed with the cmdlet's message, Unreachable set by Test-DnsConnectionError.
+
+Set-DnsLiveRecord -ServerParameter <hashtable> -ZoneName <string> -NodeName <string> -RRType <string> -Data <string> [-NewTtl <int>] [-NewData <string>]
+# -> @{ Record=<hashtable>|$null; Error; ErrorId; Unreachable=[bool] }
+# Fetches the record TWICE with Get-DnsServerResourceRecord -Node -RRType (two independent CimInstances; .Clone() is blocked in CLM and missing on 7),
+# picks the one whose Data matches, sets TimeToLive (New-TimeSpan -Seconds) and/or RecordData.IPv4Address | IPv6Address | HostNameAlias | PtrDomainName
+# as a STRING on the second copy, then Set-DnsServerResourceRecord -ZoneName -OldInputObject $old -NewInputObject $new -WhatIf:$false -Confirm:$false.
+# Target names are written with the trailing dot (the form the server returns); addresses in canonical form; -NewData is validated against the type.
+# Re-reads and returns the record; the caller logs After.Timestamp. A change that succeeded but cannot be read back gives Record = $null and Error = $null.
+
+Resolve-DnsChangeTarget -InputObject <object> -ZoneTable <object> [-Zone <string>]
+# -> @{ Kind='Name'|'Address'|'Cname'; Fqdn; Zone; NodeName; Address; Type; Data; Server } or throws (Write-Error -ErrorAction Stop with ErrorId
+#   DnsLathund.Resolve-DnsChangeTarget.<Reason>, Reason = PatternNotAllowed | ZoneNotFound | InvalidInput; the caller catches per item and re-raises
+#   it non-terminating as DnsLathund.<Cmd>.<Reason> with the same message and category, plus the item's Result).
+# Entry object (PSTypeName DnsLathund.Entry or Deserialized.DnsLathund.Entry): identity from Name/Type/Data/Zone/NodeName/Server; wildcard owners are real
+#   names and accepted; Kind 'Cname' for a CNAME entry, else 'Name' with Type/Data filled (Address = Data for A/AAAA); zone not hosted -> ZoneNotFound. Server is set only here.
+# String: address (ConvertTo-DnsNormalizedAddress) -> Address; FQDN in a hosted forward zone (Find-DnsZoneForName, longest wins; with -Zone it must lie inside it) -> Name;
+#   bare name + -Zone -> Name ('@' = apex); any * or ? -> PatternNotAllowed; dotted name outside every hosted zone, or bare name without -Zone -> ZoneNotFound;
+#   empty item -> InvalidInput. Type, Data and Server are $null.
+# CSV row hashtable (Read-DnsInputFile -Csv): Name (or Address when Name is empty) resolved like a string, the Zone column overrides -Zone; Address column ->
+#   Type A|AAAA + Data (invalid address -> InvalidInput); Target column -> Kind 'Cname', Type CNAME, Data; Address and Target together -> InvalidInput; TTL left to the caller.
+
+Get-DnsReverseZoneName -NetworkId <string>
+# -> @{ ZoneName; Family='IPv4'|'IPv6'; Prefix=[int]; Network=<string> }
+# IPv4: prefix 8, 16 or 24 only -> 'a.in-addr.arpa', 'b.a.in-addr.arpa', 'c.b.a.in-addr.arpa'. IPv6: prefix a multiple of 4 in 4..124 -> reversed nibbles + '.ip6.arpa'.
+# Any other prefix -> throw naming the nearest allowed ones. Must equal the name Add-DnsServerPrimaryZone -NetworkId derives (checked in the live test).
+
+Test-DnsWriterServer -Server <string>
+# Warning when $script:WriterServer is set and differs: "This session already changed DNS on 'dc01'; changes on 'dc02' may be lost if both touch the same node before replication."
+# The first server of the session is remembered in $script:WriterServer and kept (§7.1); later servers only warn. Case-insensitive. No output.
+
+Test-DnsConnectionError -ErrorRecord <object>
+# -> [bool]: $true when the error says the server cannot be reached: Category 'ConnectionError', or FullyQualifiedErrorId containing '1722'
+#   (RPC server unavailable), '0x800706BA' (the same as an HRESULT) or '0x8033' (WSMan transport). Used by the live write helpers to fill Unreachable (§13.9).
+# Measured 2026-10-11: an unreachable -ComputerName gives Category NotSpecified and ErrorId 'WIN32 1722,<Cmd>' from the local provider, in 0.35 s.
+
+New-DnsLiveReverseZone -Batch <hashtable> -NetworkId <string> -CopySettingsFrom <string> -ZoneTable <object> -ServerParameter <hashtable> [-ReplicationScope <string>] [-DynamicUpdate <string>] [-Credential] [-TimeoutSec <int>]
+# -> emits the DnsLathund.Result objects CreateZone and SetZoneAging through Write-DnsResult with the GIVEN batch (same BatchId as the caller's run);
+#    no other output. Everything §13.7 describes happens here: Get-DnsReverseZoneName, AlreadyDone when hosted or on 9609, Custom + partition, the
+#    gate (Confirm-DnsAction -Impact High -State $Batch.Confirm, so [A]ll at High carries across a New-DnsEntry run; declined -> Skipped
+#    'Declined at the confirmation prompt.'), Set-DnsServerZoneAging, Get-DnsZoneTable -Refresh (not under -WhatIf), the replication warning.
+# The caller reads the CreateZone Result: Success, AlreadyDone or WhatIf = zone present for the PTR step. An invalid -NetworkId or a
+#    -CopySettingsFrom zone that is not hosted is a Failed CreateZone Result plus a terminating Write-Error -ErrorAction Stop with ErrorId
+#    DnsLathund.New-DnsLiveReverseZone.<InvalidNetworkId|ZoneNotFound|ServerUnreachable>; the public caller re-raises it under its own name
+#    (per item and non-terminating for the first two, terminating for ServerUnreachable), as with Resolve-DnsChangeTarget.
+# Public New-DnsReverseZone is a thin wrapper (batch, Test-DnsWriterServer unless -WhatIf, zone table, this helper); New-DnsEntry calls the
+#    helper with its own batch when -CreateReverseZone is set.
+```
 
 ---
 
@@ -532,22 +653,25 @@ Confirm-DnsAction -Target <string> -Action <string> -Impact <Low|Medium|High> -S
 Rules, in order:
 1. `$WhatIfPreference` is `$true` → `Write-Host "What if: Performing the
    operation ""$Action"" on target ""$Target""."` → return `$false`.
-2. `-Force` or `$State.All` → return `$true`.
+2. `-Force`, or `$State.All[$Impact]` is `$true` → return `$true`.
 3. Prompt **only if** `$ConfirmPreference -ne 'None'` **and**
    `[int][System.Management.Automation.ConfirmImpact]$Impact -ge [int]$ConfirmPreference`.
    (`$ConfirmPreference` is already a `ConfirmImpact` enum value; `-Confirm:$false`
    sets it to `None` = 0, which never prompts; `-Confirm` sets it to `Low`.)
    Otherwise return `$true`.
 4. Prompt: `Read-Host "$Action`n  $Target`n[Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N)"`.
-   `y`/`yes` → `$true`; `a`/`all` → `$State.All = $true`, `$true`; `s`/`stop`
+   `y`/`yes` → `$true`; `a`/`all` → `$State.All[$Impact] = $true`, `$true`; `s`/`stop`
    → `throw "Operation stopped by the operator."`; anything else → `$false`.
 5. If `Read-Host` throws (non-interactive host) → `Write-Error -Category
    InvalidOperation -ErrorId DnsLathund.Confirm.NonInteractive -Message "This
    session cannot prompt. Re-run with -Force to confirm all actions, or
    -WhatIf to preview."` → return `$false`.
 
-The public function creates `$State = @{ All = $false }` in `begin {}` and
-passes it to every call; `-Force` is the public function's own switch.
+The public function creates `$State = @{ All = @{} }` in `begin {}` (phase 2:
+`$Batch.Confirm` from `New-DnsBatch`) and passes it to every call; `-Force`
+is the public function's own switch. "Yes to all" is remembered **per
+impact level** (changed in phase 2), so an `A` on a Medium prompt never
+approves a later High action such as `CreateZone`.
 `$WhatIfPreference` and `$ConfirmPreference` reach the helper by dynamic
 scoping from the public function that bound `-WhatIf`/`-Confirm`.
 
@@ -570,9 +694,13 @@ Line schema (all keys always present, `null` when not applicable):
 ```json
 {"Id":"<guid>","BatchId":"<guid>","Timestamp":"2026-10-09T15:00:00.0000000+02:00",
  "Operator":"DOMAIN\\user","Server":"dc01","Action":"RemoveA","Zone":"contoso.local",
- "NodeName":"srv01","Type":"A","Before":{"Data":"10.0.16.5","Ttl":3600,"Timestamp":null,"IsStatic":true},
+ "NodeName":"srv01","Name":"srv01.contoso.local","Type":"A","Data":"10.0.16.5",
+ "Before":{"Data":"10.0.16.5","Ttl":3600,"Timestamp":null,"IsStatic":true},
  "After":null,"Result":"Success","Error":null}
 ```
+`Name` (owner FQDN) and `Data` (the address or target the sub-operation is
+about) are on every line (added 2026-10-11), so a `WhatIf` or `Failed` line
+without `Before`/`After` still says which record it concerns.
 Encoding facts (verified): 5.1 writes a BOM when it creates the file, 7 does
 not; both read either; a BOM is never written mid-file. Readers use
 `Get-Content -Encoding UTF8 <file> | ConvertFrom-Json`.
@@ -634,7 +762,7 @@ available to compute `Aliases` for a live hit).
 
 | # | Property | Type |
 |---|---|---|
-| 1 | `Action` | string: `RemovePtr`, `RemoveA`, `RemoveAAAA`, `RemoveCName`, `RemoveDhcid`, `AddA`, `AddAAAA`, `AddPtr`, `AddCName`, `SetTtl`, `SetAddress`, `SetTarget`, `SetPtrTarget`, `CreateZone`, `ExportZone`, `Backup` |
+| 1 | `Action` | string: `RemovePtr`, `RemoveA`, `RemoveAAAA`, `RemoveCName`, `RemoveDhcid`, `AddA`, `AddAAAA`, `AddPtr`, `AddCName`, `SetTtl`, `SetAddress`, `SetTarget`, `SetPtrTarget`, `CreateZone`, `SetZoneAging`, `ExportZone`, `Backup` |
 | 2 | `Name` | string (FQDN) |
 | 3 | `Type` | string |
 | 4 | `Data` | string / $null |
@@ -647,6 +775,9 @@ available to compute `Aliases` for a live hit).
 | 11 | `BatchId` | string (guid) |
 | 12 | `Timestamp` | datetime |
 
+`Error` holds the reason for `Skipped` as well as for `Failed` (§5.9).
+`Data` for `CreateZone` is the NetworkId, for `Backup` the local file path.
+
 ### 12.3 `DnsLathund.Snapshot`
 
 `Server` · `Zone` · `ExportedAt` (datetime) · `Age` (timespan) · `IsReverse`
@@ -657,7 +788,7 @@ available to compute `Aliases` for a live hit).
 
 ---
 
-## 13. Public commands – phase 1
+## 13. Public commands
 
 ### 13.1 `Get-DnsEntry`
 
@@ -727,6 +858,252 @@ zones continue; the index is still rebuilt from what succeeded, and
 `meta.json` keeps the previous entry for the failed zone if one existed.
 `-Zone` entries not hosted → non-terminating error. Progress per zone.
 
+### 13.4 `Remove-DnsEntry` (phase 2)
+
+```powershell
+Remove-DnsEntry [-Identity <object[]>] [-InputFile <string>] [-Zone <string>] [-KeepPtr] [-KeepAlias] [-AllowReferenced] [-SkipReferenceCheck]
+                [-MaxSnapshotAge <timespan>] [-Delay <int>] [-Server <string>] [-Credential] [-TimeoutSec] [-LogPath] [-Force] [-WhatIf] [-Confirm]
+# pipeline: DnsLathund.Entry objects or strings (ValueFromPipeline), or objects with Name/Identity/HostName/IPAddress/Address (ByPropertyName) -> -Identity
+```
+Impact `High`, one gate per input item; `[A]ll` sticks for the batch per
+impact (§10). Streams: each item is resolved and processed in `process {}`
+(§5.7), nothing is collected first. `-Delay` sleeps once per item after
+its sub-operations.
+
+Per item:
+1. **Resolve** (`Resolve-DnsChangeTarget`), then read live
+   (`Get-DnsLiveRecord -Node`). Name → A, AAAA, CNAME, DHCID at the node.
+   Address → candidate names from the PTR targets at the expected node of
+   every covering reverse zone (`Find-DnsZoneForName -Reverse`, classless
+   hop as in §12.1) **and** from `$index.Addr` when a snapshot exists (any
+   age; without one, warn once per batch: "A records without a PTR cannot
+   be found by address without a snapshot"); keep only the A/AAAA records
+   that hold the address. Cname (an Entry of type CNAME) → only that
+   record. Nothing found at all → one Result `AlreadyDone` (Action
+   `RemoveA`, Data = the identity). PTRs found but no A → they are orphans:
+   `RemovePtr` for each (through the gate).
+2. **References** (`Get-DnsReference`): any NS, SRV or MX owner pointing at
+   the name → the whole item is `Skipped`, one Result per record that would
+   have been touched, Error = `"Referenced by 12 SRV, 2 NS and 1 MX records
+   (_ldap._tcp.contoso.local, ...). Add -AllowReferenced to remove it
+   anyway."` (first three owners listed). `Source = Unavailable` →
+   `Skipped` with `"The reference check could not run (root\MicrosoftDNS
+   on '<server>' is not reachable). Run Update-DnsSnapshot first, or pass
+   -SkipReferenceCheck."` CNAME owners pointing at the name are removed
+   last unless `-KeepAlias`; each alias gets its own reference check first
+   (an alias that SRV/NS/MX point at is `Skipped`).
+3. **PTRs**: the expected node in every covering reverse zone (shadowed
+   ones too), only PTRs whose target equals the name. A PTR in a zone with
+   `IsReadOnly` → `Skipped` ("not writable on this server") and it does not
+   block the A. `-KeepPtr` skips PTR removal entirely (Verbose, no
+   Result).
+4. **Order** per item: `RemovePtr`* → `RemoveA`/`RemoveAAAA`* →
+   `RemoveDhcid` (only when the last A/AAAA at the node was removed and a
+   DHCID exists) → `RemoveCName`* (aliases). A **write failure** on a PTR in
+   a writable zone → the A/AAAA records are `Skipped` with Error "kept to
+   avoid an orphaned PTR". A failed alias blocks nothing.
+5. **Gate**: `Confirm-DnsAction -Impact High -Action 'Remove DNS records'
+   -Target "srv01.contoso.local: remove 2 PTR, 1 A, 1 CNAME alias"`. Under
+   `-WhatIf` the gate prints one line per item and every sub-operation
+   yields a Result `WhatIf`, logged.
+6. **Execute**: each sub-operation re-reads the record (still present with
+   the same Data) → `Remove-DnsLiveRecord` → `Write-DnsResult` with
+   `Before`. `AlreadyGone` → `AlreadyDone`. A dynamic record (Timestamp
+   set) → `Write-Warning` per record and a count in the end-of-batch
+   Verbose summary; the help explains that the client or DHCP may
+   re-register it and that the dnsNode tombstone (about 7 days) keeps the
+   old ACL.
+7. Entry objects whose `Server` differs from `-Server` → one warning per
+   item. `-InputFile`: lines, or CSV with a `Name` column. A zone with more
+   than the default zone scope (`Get-DnsServerZoneScope`, once per zone per
+   batch) → one warning per zone.
+
+Errors: `PatternNotAllowed`, `ZoneNotFound` per item (non-terminating);
+unreachable server or `Confirm.NonInteractive` → terminating after the
+first occurrence (§5.8).
+
+### 13.5 `New-DnsEntry` (phase 2)
+
+```powershell
+New-DnsEntry -Name <string> -Address <string[]> [-TTL <int>] [-NoPtr] [-CreateReverseZone] [-ReplacePtr] [-Zone <string>] [common]   # set Host
+New-DnsEntry -Name <string> -Target <string> [-TTL <int>] [-Zone <string>] [common]                                                  # set Alias (CNAME)
+New-DnsEntry -InputFile <string> [-NoPtr] [-CreateReverseZone] [-ReplacePtr] [-Zone <string>] [common]                               # set File (CSV: Name, Address|Target[, TTL][, Zone])
+# common: [-Delay <int>] [-Server <string>] [-Credential] [-TimeoutSec] [-LogPath] [-Force] [-WhatIf] [-Confirm]; pipeline by property name into Host/Alias
+```
+Impact `Medium`; the `CreateZone` step is `High`. `-TTL` in seconds (alias
+`TimeToLive`); without it the zone default applies (no `-TimeToLive`
+passed). Records are static. `-Name` is the record owner for both sets
+(DnsServer's `-HostNameAlias` names the *target*, so "alias" is never a
+parameter name here).
+
+Preflight per item, nothing written until every check passed: zone from
+the FQDN (`Find-DnsZoneForName`) or `-Zone` + bare name; the node has a
+CNAME → `Failed` (`NodeIsCname`); Alias set and the node has any record →
+`Failed` (`CnameCollision`); an NS record on any ancestor label inside the
+zone (live, one `Get-DnsLiveRecord -RRType NS` per label) → `Failed`
+(`Delegated`); reverse zone for the address missing and neither `-NoPtr`
+nor `-CreateReverseZone` → `Failed` (`NoReverseZone`, the message names
+both switches) **and the A is not created**; the expected reverse node is
+an RFC 2317 CNAME → the PTR goes into the classless zone when hosted, else
+`Failed` (`Delegated`).
+
+Then: `AddA`/`AddAAAA` per address (identical record → `AlreadyDone`;
+same address with another TTL → `AlreadyDone` plus a warning); `AddPtr`
+(PTR with the same target → `AlreadyDone`; PTR with another target →
+`Skipped` unless `-ReplacePtr`, which does `RemovePtr` + `AddPtr`). With
+`-CreateReverseZone` the /24 (IPv4) or /64 (IPv6) zone around the address
+is created through `New-DnsLiveReverseZone -Batch $batch -CopySettingsFrom
+<forward zone>` (§7.5: same BatchId, [A]ll at High carries to the next item)
+before `AddPtr`; under `-WhatIf` a `CreateZone` with `Result = WhatIf`
+counts as created for the PTR step and `Get-DnsZoneTable -Refresh` is
+skipped. A write that fails with 9709 (CNAME collision: another record type at the node) →
+`Failed` (`CnameCollision`).
+
+### 13.6 `Set-DnsEntry` (phase 2)
+
+```powershell
+Set-DnsEntry [-Identity <object[]>] [-Zone <string>] [-TTL <int>] [-Address <string>] [-PtrTarget <string>] [-Target <string>]
+             [-ReplacePtr] [-IncludeDynamic] [-Delay <int>] [-Server <string>] [-Credential] [-TimeoutSec] [-LogPath] [-Force] [-WhatIf] [-Confirm]
+# pipeline as in 13.4. At least one of -TTL, -Address, -PtrTarget, -Target, else a terminating error.
+```
+Impact: `-Address` `High`, the others `Medium`.
+- Requested value equals the current value → `AlreadyDone`.
+- `-TTL`: every A/AAAA/CNAME at the node (the exact record when the input
+  is an Entry) and every PTR that points at the name → `SetTtl` each, in
+  place (`Set-DnsLiveRecord`).
+- `-Address`: exactly one record must be addressed (an Entry, or
+  `-Identity` naming a node with a single A/AAAA); several → per-item
+  error `Ambiguous` telling the user to pipe the entry from `Get-DnsEntry`.
+  `SetAddress` in place, then PTR sync: `RemovePtr` for the old PTR when it
+  points at the name, `AddPtr` in the new address's reverse zone (missing
+  → `Skipped` + warning; existing PTR with another target → `Skipped`
+  unless `-ReplacePtr`).
+- `-PtrTarget`: the identity must be an address; the PTR at the expected
+  node → `SetPtrTarget`; no PTR → `AddPtr`.
+- `-Target`: the identity must be a CNAME → `SetTarget` (9707 CNAME loop →
+  `Failed`).
+- Dynamic records (A, AAAA or PTR with a Timestamp) → `Skipped` with Error
+  `"Dynamic record, owned by the client or the DHCP server; re-register it
+  instead, or pass -IncludeDynamic."` unless `-IncludeDynamic` → warning
+  and proceed. After every Set the record is re-read and `After.Timestamp`
+  is logged; the help states what the server does to the timestamp
+  (decided by the live test).
+
+### 13.7 `New-DnsReverseZone` (phase 2)
+
+```powershell
+New-DnsReverseZone -NetworkId <string> -CopySettingsFrom <string> [-ReplicationScope <Domain|Forest|Legacy|Custom>] [-DynamicUpdate <None|NonsecureAndSecure|Secure>]
+                   [-Server <string>] [-Credential] [-TimeoutSec] [-LogPath] [-Force] [-WhatIf] [-Confirm]
+```
+Impact `High`. A thin wrapper: `New-DnsBatch`, `Test-DnsWriterServer` (not
+under `-WhatIf`), `Get-DnsZoneTable`, then `New-DnsLiveReverseZone` (§7.5),
+which does everything below. Zone name from `Get-DnsReverseZoneName` (an
+invalid `-NetworkId` → terminating `InvalidNetworkId`; a `-CopySettingsFrom`
+zone that is not hosted → `Failed` `ZoneNotFound`). Already hosted on the
+server, or 9609 (`DNS_ERROR_ZONE_ALREADY_EXISTS`) from the cmdlet →
+`AlreadyDone`. Settings come from the `-CopySettingsFrom`
+forward zone (`Get-DnsZoneTable`): `Add-DnsServerPrimaryZone -NetworkId
+<id> -ReplicationScope Custom -DirectoryPartitionName <forward zone's
+partition> -DynamicUpdate <forward zone's value>` (same result as
+Domain/Forest, and right from a child domain too). Forward zone without a
+partition (file-backed) or `Legacy` → `Failed` `"... specify
+-ReplicationScope"` unless `-ReplicationScope` is given (then that scope is
+used as given, with `-DirectoryPartitionName` only for `Custom`). Then
+`Set-DnsServerZoneAging -Name <zone> -Aging <bool> -RefreshInterval
+-NoRefreshInterval -ScavengeServers ([ipaddress[]])` from the forward zone;
+aging fields `$null` → step skipped with a warning. Results: `CreateZone`
+(Data = NetworkId), `SetZoneAging` (only when the zone was created, or would
+be under `-WhatIf`). Afterwards `Get-DnsZoneTable -Refresh`
+(not under `-WhatIf`) and a warning that other DCs see the zone only after
+AD replication plus DsPollingInterval (default 180 s).
+
+### 13.8 `Backup-DnsZone` (phase 2)
+
+```powershell
+Backup-DnsZone [-Zone <string[]>] [-Path <string>] [-Server <string>] [-Credential] [-TimeoutSec] [-LogPath] [-Force] [-WhatIf] [-Confirm]
+# -Path alias BackupPath; default $env:LOCALAPPDATA\DnsLathund\backup
+```
+Impact `Low`, one gate for the run (declined → no output). `Test-DnsWriterServer`
+is not called: nothing changes in DNS. Folder `<Path>\<server>-<yyyyMMdd-HHmmss>\`
+(never reused: an existing folder → terminating error; the stamp is taken after the gate),
+one `backup_<zone>_<yyyyMMdd-HHmmss>.txt` per zone through
+`Export-DnsZoneFile`, plus one `RESTORE.md` (English: restore a single
+record with `New-DnsEntry`; restore a whole AD-integrated zone with
+`dnscmd /zoneadd <zone> /primary /file <file> /load` followed by
+`ConvertTo-DnsServerPrimaryZone -ReplicationScope`; note that the SOA
+serial and aging timestamps are not restored). Default: every exportable
+zone (§8). A requested zone that is not hosted or not exportable → a
+`Failed` Result (Data `$null`) and a non-terminating error with the texts of
+`Update-DnsSnapshot` (`ZoneNotFound`, `ZoneNotExportable`), written before
+the gate; the rest continue. One Result per zone: Action `Backup`, Data =
+local file path, `Failed` with the export error (ErrorId `ExportFailed`)
+otherwise. `RESTORE.md` is written in `finally` and lists only the files that
+exist, so a stop after some zones still leaves instructions; nothing saved →
+the empty folder is removed. Known gap: `Export-DnsZoneFile` re-throws as a
+plain string, so a server lost mid-run gives per-zone `Failed`, not the §5.8
+abort (acceptable: the command only reads).
+
+### 13.9 Shared rules for the change commands
+
+- `New-DnsBatch` in `begin {}`; `Test-DnsWriterServer`; `Import-DnsServerModule`
+  through `Get-DnsZoneTable`. Every sub-operation → exactly one
+  `Write-DnsResult` call, emitted immediately (streaming).
+- `-Force` = zero prompts (§10 rule 2), nothing else. Safety overrides have
+  their own switches: `-AllowReferenced`, `-IncludeDynamic`, `-ReplacePtr`,
+  `-SkipReferenceCheck`.
+- After writes the snapshot index is not patched; one Verbose line per run
+  reminds about `Update-DnsSnapshot`.
+- `Confirm.NonInteractive` or an unreachable server on the first item →
+  terminating error (§5.8); no per-item repetition.
+- Error codes (classified on `FullyQualifiedErrorId`; values checked
+  against winerror.h 2026-10-11, which cmdlet raises which is confirmed in
+  the live test): 9701 record missing and 9714 name missing (removal →
+  `AlreadyDone`), 9711 record exists (add → `AlreadyDone`), 9708 node is a
+  CNAME, 9709 CNAME collision, 9707 CNAME loop, 9710 allowed only at the
+  apex, 9706 name outside the zone (all `Failed`), 9712 secondary
+  (read-only) data → `Skipped`, 9601 zone missing, 5 access denied →
+  `Failed`, never `AlreadyDone`, 1722 RPC server unavailable → batch abort.
+- The live write helpers return `ErrorId` and `Unreachable`
+  (`Test-DnsConnectionError`). `Unreachable = $true` → the command writes
+  the item's `Failed` Result, then throws the terminating error of §5.8
+  (ErrorId `DnsLathund.<Cmd>.ServerUnreachable`, text `"The DNS server '<s>'
+  cannot be reached: <error> The run was stopped; the remaining input was
+  not processed. Check the server and run the command again."`).
+- Aligned 2026-10-11 after the wave-2 review:
+  - `-Identity` is `[object[]]`, `ValueFromPipeline` only (never
+    `ByPropertyName`): Entry objects, strings, `[ipaddress]`, and objects
+    with `Identity`/`Name`/`HostName`/`IPAddress`/`Address` read by hand.
+    `[string[]]` would coerce a piped Entry to text and lose the record.
+  - `Test-DnsWriterServer` runs only when not under `-WhatIf`: a preview
+    never becomes the session's writer server.
+  - `-Delay` sleeps once per input item after its sub-operations, failed
+    items included, never under `-WhatIf`.
+  - The gate is shown only when something is to be written; an item that
+    is already in place never prompts. Answer No → every pending
+    sub-operation of the item is `Skipped` with Error `"Declined at the
+    confirmation prompt."` (logged). `Confirm.NonInteractive` is raised once
+    as a terminating error; no Result for the item.
+  - PTR sub-operations (`RemovePtr`, `AddPtr`, `SetPtrTarget`, `SetTtl` on a
+    PTR): `Name` = the PTR owner FQDN (`20.16.0.10.in-addr.arpa`), `Zone` =
+    the reverse zone, `NodeName` = `20`, `Data` = the target name.
+  - A Result and its log line are written before the matching `Write-Error`,
+    so `-ErrorAction Stop` still leaves the line.
+  - `Set-DnsEntry`: `-Address`, `-PtrTarget` and `-Target` exclude each other
+    (`ConflictingChanges`); `-TTL` combines with any of them and its `SetTtl`
+    runs after the value change; `-Address` equal to the current address →
+    `AlreadyDone` and the PTR sync still runs; `-PtrTarget` accepts an A/AAAA
+    Entry (its address).
+  - `New-DnsEntry`: default parameter set `File` (needed for pipeline
+    binding of CSV rows); `-NoPtr` with `-CreateReverseZone` or
+    `-ReplacePtr` → terminating error; a preflight failure gives one `Failed`
+    Result per requested record and no PTR Results; a PTR that already
+    points at this name and at another stays as it is (`AlreadyDone`).
+  - `Remove-DnsEntry`: a reference blocks the whole item; with Source
+    `Unavailable` the item is skipped even with `-AllowReferenced`
+    (`-SkipReferenceCheck` is the override); a read-only forward zone skips
+    the whole name including its PTRs; a blank string is skipped with a
+    Verbose line; `Before` is logged on `Success`.
+
 ---
 
 ## 14. Formatting (`DnsLathund.Format.ps1xml`)
@@ -783,6 +1160,23 @@ sub-zone block, and a wildcard owner.
   every stub function is declared as `function script:Name` – later-phase
   stubs must follow the same pattern. Tests must pass with and without
   RSAT installed.
+- **Phase-2 stubs** (same file, same `function script:` pattern):
+  `Add-DnsServerResourceRecordA/AAAA/CName/Ptr` (`-ZoneName -Name`,
+  `-IPv4Address|-IPv6Address|-HostNameAlias|-PtrDomainName`, `-TimeToLive`,
+  `-AgeRecord`, `-CreatePtr`, `-PassThru`), `Remove-DnsServerResourceRecord`
+  (`-InputObject` from the pipeline, `-Force`), `Set-DnsServerResourceRecord`
+  (`-OldInputObject -NewInputObject`), `Add-DnsServerPrimaryZone` (both the
+  `-Name` and the `-NetworkId` sets, `-ReplicationScope`,
+  `-DirectoryPartitionName`, `-DynamicUpdate`), `Set-DnsServerZoneAging`,
+  `Get-DnsServerZoneScope`, and `Get-CimInstance` (`-Namespace
+  root\MicrosoftDNS -Query`, with a minimal WQL reader: `FROM <class> WHERE
+  ContainerName='z' [AND <prop>='v']`, targets with a trailing dot). Every
+  writing stub declares `SupportsShouldProcess`, skips the change when
+  `$WhatIfPreference` is set, counts calls, supports `Fail` injection per
+  command and zone, returns **copies** of records (so the "fetch twice"
+  pattern of `Set-DnsLiveRecord` works), gives records a stable `Id` so
+  that `-OldInputObject` can be matched, and raises the error codes of
+  §13.9 as `WIN32 <code>` in the FullyQualifiedErrorId.
 - **File format tool:** `build\Set-SourceFileFormat.ps1` normalises `.ps1`,
   `.psm1`, `.psd1`, `.ps1xml` and `*.help.txt` only. Zone-file fixtures
   (`Tests\Fixtures\*.txt`) must stay BOM-less with CRLF, like a real export.
@@ -795,7 +1189,7 @@ sub-zone block, and a wildcard owner.
   `Invoke`, `Create`, `TryParse`, `GetNewClosure`, or a static call on a
   type outside an allow-list; `CommandAst` for `New-Object` (anything but
   `PSObject`), `Add-Type`, `Invoke-Expression`, and the internal write
-  cmdlets without `-WhatIf:$false`; `AssignmentStatementAst` `PlusEquals`
+  cmdlets without `-WhatIf:$false` (from phase 2 also the DnsServer write cmdlets `Add-DnsServerResourceRecordA|AAAA|CName|Ptr`, `Remove-DnsServerResourceRecord`, `Set-DnsServerResourceRecord`, `Add-DnsServerPrimaryZone`, `Set-DnsServerZoneAging`); rule 14: `InvokeMemberExpressionAst` with member `Clone`, and `[ciminstance]::new`; `AssignmentStatementAst` `PlusEquals`
   inside loops/`ForEach-Object`; `TypeDefinitionAst`; `UsingStatementAst`;
   `[ref]`.
 - **`ClmSmoke.Tests.ps1`**: starts `powershell.exe -NoProfile
@@ -803,8 +1197,10 @@ sub-zone block, and a wildcard owner.
   as a **child process** (never in the Pester process – one failed cast
   poisons the process, #28128). The runner creates a runspace with
   `InitialSessionState.LanguageMode = 'ConstrainedLanguage'`, imports the
-  module, loads the stubs, runs `Get-DnsSnapshot`, `Update-DnsSnapshot -WhatIf`
-  and `Get-DnsEntry` against stub data, and exits non-zero on any error or
+  module, loads the stubs, runs `Get-DnsSnapshot`, `Update-DnsSnapshot -WhatIf`,
+  `Get-DnsEntry` and, from phase 2, `Remove-DnsEntry -WhatIf`, `Backup-DnsZone -WhatIf`, `New-DnsEntry
+  -WhatIf` and `Set-DnsEntry -WhatIf` (every Result must have `Result =
+  WhatIf`) against stub data, and exits non-zero on any error or
   any output containing `Only core types` / `Method invocation is supported
   only on core types`. The Pester test asserts on exit code and output.
   Also run it with `pwsh`.
