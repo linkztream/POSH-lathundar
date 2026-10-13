@@ -18,7 +18,8 @@
     - $ORIGIN for the zone and for a relative sub-domain block, absolute owners
     - SRV (rdata with spaces), MX, NS, CNAME, DHCID, WINS, TXT, a wildcard owner
       "*", an owner with a "\040" escape (Windows writes \DDD in octal, so
-      this is a space) and owners with "åäö"
+      this is a space) and owners with "åäö", written like Windows writes
+      them: one octal escape per UTF-8 byte ("\303\245\303\244\303\266")
     - optionally a "Delegated sub-zone" comment block with its NS record
 
     The output is deterministic for a given -Seed on both Windows PowerShell 5.1
@@ -59,7 +60,8 @@
     writes a delegation.
 
 .PARAMETER NonAsciiRatio
-    Share (0..1) of client host names that contain Swedish letters (åäö).
+    Share (0..1) of client host names that contain Swedish letters (åäö),
+    written as escaped UTF-8 bytes like a real export.
 
 .PARAMETER AgingRatio
     Share (0..1) of client records written as dynamic, that is with "[AGE:n]" and
@@ -145,6 +147,10 @@ $rng = New-Object System.Random $Seed
 $pad24 = ' ' * 24
 # Real AGE values are hours since 1601-01-01; 3 731 000 is mid-2026.
 $ageBase = 3731000
+# Windows writes a non-ASCII character as one octal escape per UTF-8 byte:
+# 'åäö' is C3 A5 C3 A4 C3 B6 (verified on a live export 2026-10-13).
+$escapedAao = '\303\245\303\244\303\266'
+$nonAsciiOwner = "kontor-$escapedAao"
 
 # Expected parser results, maintained while writing.
 $typeCounts = @{}
@@ -346,8 +352,9 @@ try {
             }
         }
 
-        # Special owners: wildcard, an octal \040 escape (a space, as Windows writes it) and åäö.
-        foreach ($special in @('*', 'print\040room', 'kontor-åäö')) {
+        # Special owners: wildcard, an octal \040 escape (a space, as Windows writes it)
+        # and 'kontor-åäö', whose letters Windows writes as escaped UTF-8 bytes.
+        foreach ($special in @('*', 'print\040room', $nonAsciiOwner)) {
             if ($rowCount -ge $RecordCount) { break }
             $addressCursor = ($addressCursor % $hostSpace) + 1
             $v = $netBase + $addressCursor
@@ -460,7 +467,7 @@ try {
 
             # DHCP-registered client: A, then DHCID when dynamic, sometimes AAAA.
             $nameRoll = $rng.NextDouble()
-            if ($nameRoll -lt $NonAsciiRatio) { $owner = "dator-åäö-$hostIndex" }
+            if ($nameRoll -lt $NonAsciiRatio) { $owner = "dator-$escapedAao-$hostIndex" }
             elseif ($nameRoll -lt $NonAsciiRatio + 0.01) { $owner = "printer-floor03-building-a-$hostIndex" }
             else { $owner = "ws-$hostIndex" }
             $column = $owner.PadRight(23) + ' '

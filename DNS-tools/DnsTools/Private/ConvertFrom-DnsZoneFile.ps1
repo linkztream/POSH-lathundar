@@ -12,7 +12,8 @@
         Each row has exactly six fields, OWNER, TYPE, DATA, TTL, AGE and ADDR,
         joined with a tab (CONTRACTS.md section 9.2):
         - OWNER: FQDN, lower-case, no trailing dot, \DDD escapes decoded as octal
-          (Windows writes \040 for a space); '@' is the current origin and
+          (Windows writes \040 for a space, and one escape per UTF-8 byte for a
+          non-ASCII character: \303\244 is 'ä'); '@' is the current origin and
           continuation lines inherit the previous owner.
         - TYPE: upper-case.
         - DATA: canonical address for A/AAAA; target FQDN (normalised like OWNER)
@@ -28,8 +29,10 @@
         The file is streamed with switch -Regex -File, which works in
         Constrained Language Mode and reads BOM-less exports as UTF-8 on Windows
         PowerShell 5.1. All per-line logic is inline because a function call per
-        line costs minutes on a 550 000-record zone. This function has no
-        dependency on any other module function.
+        line costs minutes on a 550 000-record zone; only the decoding of \DDD
+        escapes, which runs just for names that contain a backslash, is a local
+        script block. This function has no dependency on any other module
+        function.
 
     .PARAMETER Path
         The zone export file.
@@ -199,9 +202,53 @@
             }
         ) -join ':')
     # Windows writes \DDD in OCTAL (\040 is a space), not the decimal of RFC 1035
-    # (CONTRACTS.md section 7.4). The value is computed as d1*64 + d2*8 + d3 because
-    # [Convert]::ToInt32(x, 8) is blocked in Constrained Language Mode.
-    $escapeRegex = [regex]'\\([0-3][0-7]{2})'
+    # (CONTRACTS.md section 7.4), and writes a non-ASCII character as one escape per
+    # UTF-8 byte ('ä' is \303\244). One match is either a well-formed UTF-8 sequence
+    # of two to four escaped bytes (RFC 3629 section 4; \2DD is a continuation byte,
+    # 0x80-0xBF) or a single escape, which is one character on its own. A byte that
+    # is not part of a well-formed sequence (a Latin-1 \344) thus stays that one
+    # character instead of failing.
+    $escapeRegex = [regex](
+        '\\3(?:0[2-7]|[1-3][0-7])\\2[0-7]{2}' +
+        '|(?:\\340\\2[4-7][0-7]|\\3(?:4[1-7]|5[0-4]|5[67])\\2[0-7]{2}|\\355\\2[0-3][0-7])\\2[0-7]{2}' +
+        '|(?:\\360\\2[2-7][0-7]|\\36[1-3]\\2[0-7]{2}|\\364\\2[01][0-7])(?:\\2[0-7]{2}){2}' +
+        '|\\[0-3][0-7]{2}'
+    )
+    # Decodes the escapes of one name and lower-cases it. A script block, not inline
+    # code, because owners, targets and $ORIGIN all need it; it is invoked only for a
+    # name that contains a backslash, so the per-line path stays free of calls. No
+    # [ref], delegate or [System.Text.Encoding] (CLM): the string is rebuilt from the
+    # match positions and UTF-8 is decoded by hand. Octal by hand too, d1*64 + d2*8
+    # + d3, because [Convert]::ToInt32(x, 8) is blocked in Constrained Language Mode.
+    $decodeEscapes = {
+        param ([string]$Name)
+
+        $escapeAt = 0
+        $escapePieces = foreach ($escape in $escapeRegex.Matches($Name)) {
+            $Name.Substring($escapeAt, $escape.Index - $escapeAt)
+            $escapeAt = $escape.Index + $escape.Length
+            $sequence = $escape.Value
+            $code = 64 * [int]$sequence.Substring(1, 1) + 8 * [int]$sequence.Substring(2, 1) + [int]$sequence.Substring(3, 1)
+            if ($sequence.Length -gt 4) {
+                # The payload bits of the lead byte (5, 4 or 3 for a sequence of 2, 3
+                # or 4 bytes), then six bits per continuation byte \2DD: 8 * D + D.
+                $code = $code -band (0x7F -shr ($sequence.Length / 4))
+                for ($digitAt = 6; $digitAt -lt $sequence.Length; $digitAt += 4) {
+                    $code = ($code -shl 6) -bor (8 * [int]$sequence.Substring($digitAt, 1) + [int]$sequence.Substring($digitAt + 1, 1))
+                }
+            }
+            if ($code -gt 0xFFFF) {
+                # Beyond U+FFFF a [char] cannot hold it: a UTF-16 surrogate pair.
+                $code = $code - 0x10000
+                [string][char](0xD800 + ($code -shr 10))
+                [string][char](0xDC00 + ($code -band 0x3FF))
+            }
+            else {
+                [string][char]$code
+            }
+        }
+        ((-join $escapePieces) + $Name.Substring($escapeAt)).ToLowerInvariant()
+    }
     # Whole-token numbers only, so that digits inside 'ns1.contoso.local.' never count.
     $numberRegex = [regex]'(?<![^\s(])\d+(?![^\s)])'
     # Numeric (or hex nibble) labels collapse to '#', so warnings group owners by shape.
@@ -287,15 +334,8 @@
                     $owner = $rawOwner.ToLowerInvariant() + $originSuffix
                 }
                 if ($rawOwner.Contains('\')) {
-                    # Rare, so the decoding cost is paid only here. No [ref] or delegate
-                    # (CLM): rebuild the string from the match positions.
-                    $escapeAt = 0
-                    $escapePieces = foreach ($escape in $escapeRegex.Matches($owner)) {
-                        $owner.Substring($escapeAt, $escape.Index - $escapeAt)
-                        [string][char](64 * [int]$escape.Value.Substring(1, 1) + 8 * [int]$escape.Value.Substring(2, 1) + [int]$escape.Value.Substring(3, 1))
-                        $escapeAt = $escape.Index + $escape.Length
-                    }
-                    $owner = ((-join $escapePieces) + $owner.Substring($escapeAt)).ToLowerInvariant()
+                    # Rare, so the decoding cost is paid only here.
+                    $owner = & $decodeEscapes $owner
                 }
             }
             elseif ($null -eq $owner) {
@@ -424,13 +464,7 @@
                 $target = $target.ToLowerInvariant() + $originSuffix
             }
             if ($target.Contains('\')) {
-                $escapeAt = 0
-                $escapePieces = foreach ($escape in $escapeRegex.Matches($target)) {
-                    $target.Substring($escapeAt, $escape.Index - $escapeAt)
-                    [string][char](64 * [int]$escape.Value.Substring(1, 1) + 8 * [int]$escape.Value.Substring(2, 1) + [int]$escape.Value.Substring(3, 1))
-                    $escapeAt = $escape.Index + $escape.Length
-                }
-                $target = ((-join $escapePieces) + $target.Substring($escapeAt)).ToLowerInvariant()
+                $target = & $decodeEscapes $target
             }
 
             if ($type -ne 'PTR') {
@@ -523,13 +557,7 @@
                     $origin = $argument.ToLowerInvariant() + $originSuffix
                 }
                 if ($origin.Contains('\')) {
-                    $escapeAt = 0
-                    $escapePieces = foreach ($escape in $escapeRegex.Matches($origin)) {
-                        $origin.Substring($escapeAt, $escape.Index - $escapeAt)
-                        [string][char](64 * [int]$escape.Value.Substring(1, 1) + 8 * [int]$escape.Value.Substring(2, 1) + [int]$escape.Value.Substring(3, 1))
-                        $escapeAt = $escape.Index + $escape.Length
-                    }
-                    $origin = ((-join $escapePieces) + $origin.Substring($escapeAt)).ToLowerInvariant()
+                    $origin = & $decodeEscapes $origin
                 }
                 $originSuffix = ".$origin"
             }

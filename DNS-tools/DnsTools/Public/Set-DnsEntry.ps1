@@ -5,11 +5,13 @@
 
     .DESCRIPTION
         Set-DnsEntry changes existing A, AAAA, CNAME and PTR records on one
-        Microsoft DNS server without deleting and re-creating them. Every change of
-        a value goes through Set-DnsServerResourceRecord with the record as it is
-        and as it should be, so the record keeps its node, its AD object and its
-        permissions. Only the PTR records that follow an address change are
-        removed and added.
+        Microsoft DNS server without deleting and re-creating them. A change of an
+        address or a target goes through Set-DnsServerResourceRecord with the
+        record as it is and as it should be, and a TTL change through the WMI
+        method Modify in root\MicrosoftDNS, so the record keeps its node, its AD
+        object and its permissions. Only the PTR records that follow an address
+        change are removed and added (and the PTR records that a server deletes
+        on its own, see the notes).
 
         What to change (at least one; -Address, -PtrTarget and -Target exclude each
         other, -TTL can be combined with any of them):
@@ -24,11 +26,11 @@
           family. Exactly one record must be named: an entry piped from
           Get-DnsEntry, or a name that has a single A/AAAA record (a name with
           several gives the error Ambiguous). The PTR records follow: the PTR of
-          the old address that points at the name is removed, and a PTR for the
-          new address is added in its reverse zone. When no reverse zone covers the
-          new address the PTR step is skipped with a warning; when the new address
-          already has a PTR that points at another name it is skipped too, unless
-          -ReplacePtr is given.
+          the old address that points at the name is removed first, then the
+          address is changed, then a PTR for the new address is added in its
+          reverse zone. When no reverse zone covers the new address the PTR step is
+          skipped with a warning; when the new address already has a PTR that
+          points at another name it is skipped too, unless -ReplacePtr is given.
         - -PtrTarget: the target of the PTR record of an IP address (or of the
           address of a piped A/AAAA entry), in the reverse zone that is expected to
           hold it (the longest hosted one). When the address has no PTR record
@@ -95,6 +97,7 @@
         Change dynamic records too (A, AAAA or PTR with an aging timestamp, as
         registered by clients or the DHCP server). Each one gives a warning,
         because the client or the DHCP server may register the old value again.
+        The changed record becomes static (the server clears its timestamp).
         Without it such records are Skipped.
 
     .PARAMETER Delay
@@ -161,8 +164,9 @@
     .EXAMPLE
         Set-DnsEntry www.contoso.local -Target web02.contoso.local -Server dc01 -Confirm:$false
 
-        Points the alias www at web02.contoso.local without prompting. A target that
-        would make the alias point at itself is refused by the server (Failed).
+        Points the alias www at web02.contoso.local without prompting. Check the
+        target name first: the server accepts a target that makes the alias point
+        at itself, and Set-DnsEntry does not detect it.
 
     .INPUTS
         System.String
@@ -198,16 +202,29 @@
         - Timestamp (datetime): when the sub-operation was finished.
 
     .NOTES
-        - Changes are made in place with Set-DnsServerResourceRecord (the record is
-          read twice, the second copy is changed). Records are never deleted and
-          re-created for a value change; only PTR records are removed and added
-          when an address moves.
-        - Aging timestamps: after every change the record is read again, and the
-          change log holds its timestamp before and after the change
-          (Before.Timestamp, After.Timestamp), so the log shows what the server
-          did to it. Verified in the live test: [LIVE TEST RESULT PENDING - the
-          lead fills in whether Set-DnsServerResourceRecord keeps, clears or
-          renews the timestamp of a dynamic record.]
+        - Changes are made in place: addresses and targets with
+          Set-DnsServerResourceRecord (the record is read twice, the second copy
+          is changed), TTLs with the WMI method Modify in root\MicrosoftDNS.
+          Records are never deleted and re-created for a value change; only PTR
+          records are removed and added when an address moves.
+        - Aging timestamps: every change makes the record static; the server
+          clears the aging timestamp of the changed record (verified on Windows
+          Server 2025 on 2026-10-13). After every change the record is read again,
+          and the change log holds its timestamp before and after the change
+          (Before.Timestamp, After.Timestamp).
+        - PTR records deleted by the server: Windows Server 2025 deletes the PTR
+          record that points at a name when its A or AAAA record is changed with
+          Set-DnsServerResourceRecord, a TTL change included (verified on
+          2026-10-13); older servers leave it. TTL changes therefore use WMI,
+          which leaves the PTR alone. For -Address the old PTR is removed before
+          the address changes, so the log is complete on every server. When WMI
+          cannot be used (no CIM session, or the namespace is blocked), the TTL is
+          changed with Set-DnsServerResourceRecord instead; afterwards the PTR
+          records of the name are read again, and one that the server deleted is
+          re-created with the new TTL (a RemovePtr and an AddPtr result, and one
+          warning per run).
+        - A CNAME that points at itself is accepted by the server (verified on
+          Windows Server 2025 on 2026-10-13) and is not detected by Set-DnsEntry.
         - Dynamic records belong to the client or the DHCP server, which may
           register the old value again. They are skipped unless -IncludeDynamic
           is given.
@@ -356,7 +373,12 @@
         }
 
         $dynamicText = 'Dynamic record, owned by the client or the DHCP server; re-register it instead, or pass -IncludeDynamic.'
+        $serverDeletedText = 'Removed by the DNS server together with the A record change.'
         $identityProperties = @('Identity', 'Name', 'HostName', 'IPAddress', 'Address')
+        # Set once a TTL change could not use WMI: the rest of the run uses the
+        # DnsServer cmdlet directly (CONTRACTS.md 7.5, 13.6).
+        $wmiUnavailable = $false
+        $recreateWarned = $false
 
         # --- Server context ---
         $serverKey = Resolve-DnsServerName -Server $Server
@@ -667,10 +689,14 @@
                 }
 
                 # PTR records to remove: the old address's PTRs that point at the
-                # name, then (with -ReplacePtr) the new address's PTRs to other names.
-                $removals = @()
+                # name, BEFORE the address changes (the server may delete them as a
+                # side effect, and then they would be missing from the log;
+                # CONTRACTS.md 13.6), and with -ReplacePtr the new address's PTRs to
+                # other names, after it.
+                $oldRemovals = @()
+                $replaceRemovals = @()
                 if ($oldAddress -ne $newAddress) {
-                    $removals = @(
+                    $oldRemovals = @(
                         foreach ($node in @($ptrNodes[$oldAddress])) {
                             foreach ($ptrRecord in @($node['Ptrs'])) {
                                 if ($ptrRecord['Data'] -eq $ownerName) {
@@ -716,13 +742,13 @@
                         $addPtrOperation['Result'] = 'AlreadyDone'
                         $addPtrOperation['Before'] = $ownPtrs[0]
                         if ($hasTtl) {
-                            $ttlSubjects = @(@{ Record = $ownPtrs[0]; Current = $ownerName; Needs = @($addressOperation) })
+                            $ttlSubjects = @(@{ Record = $ownPtrs[0]; Current = $ownerName; Needs = @($addressOperation); PtrAddress = $newAddress })
                         }
                     }
                     elseif ($otherPtrs.Count -gt 0) {
                         $otherTargets = @(foreach ($ptrRecord in $otherPtrs) { $ptrRecord['Data'] }) -join ', '
                         if ($ReplacePtr) {
-                            $removals = @($removals) + @(foreach ($ptrRecord in $otherPtrs) { @{ Node = $expectedNode; Record = $ptrRecord } })
+                            $replaceRemovals = @(foreach ($ptrRecord in $otherPtrs) { @{ Node = $expectedNode; Record = $ptrRecord } })
                         }
                         else {
                             $addPtrOperation['Result'] = 'Skipped'
@@ -736,8 +762,31 @@
                     }
                 }
 
-                $removeOperations = @(
-                    foreach ($removal in $removals) {
+                # The old PTRs go first but only when the address change will run
+                # (PlannedWith); the address changes only after they are gone, unless
+                # their zone is read-only here, where the server cannot delete them
+                # either (Needs).
+                $oldRemoveOperations = @(
+                    foreach ($removal in $oldRemovals) {
+                        $node = $removal['Node']
+                        $ptrRecord = $removal['Record']
+                        @{
+                            Action = 'RemovePtr'; Name = $node['Owner']; Type = 'PTR'; Data = $ptrRecord['Data']; Zone = $node['Zone']; NodeName = $node['NodeName']
+                            Before = $ptrRecord; Write = 'Remove'; RRType = 'PTR'; Current = $ptrRecord['Data']; Needs = @(); PlannedWith = @($addressOperation)
+                            Summary = "remove PTR $($node['Owner']) -> $($ptrRecord['Data'])"
+                        }
+                    }
+                )
+                $addressOperation['Needs'] = @(
+                    foreach ($removeOperation in $oldRemoveOperations) {
+                        $removeZone = $zoneLookup[[string]$removeOperation['Zone']]
+                        if ($null -eq $removeZone -or $removeZone.IsReadOnly -ne $true) {
+                            $removeOperation
+                        }
+                    }
+                )
+                $replaceRemoveOperations = @(
+                    foreach ($removal in $replaceRemovals) {
                         $node = $removal['Node']
                         $ptrRecord = $removal['Record']
                         @{
@@ -751,7 +800,7 @@
                 # address ends up with two PTR records.
                 if ($ReplacePtr) {
                     $addPtrOperation['Needs'] = @($addressOperation) + @(
-                        foreach ($removeOperation in $removeOperations) {
+                        foreach ($removeOperation in $replaceRemoveOperations) {
                             if ($removeOperation['Zone'] -eq $addPtrOperation['Zone'] -and $removeOperation['NodeName'] -eq $addPtrOperation['NodeName']) {
                                 $removeOperation
                             }
@@ -759,7 +808,7 @@
                     )
                 }
 
-                $valueOperations = @(@($addressOperation) + $removeOperations + @($addPtrOperation))
+                $valueOperations = @($oldRemoveOperations) + @($addressOperation) + @($replaceRemoveOperations) + @($addPtrOperation)
                 if ($hasTtl) {
                     $ttlSubjects = @(@{ Record = $hostRecord; Current = $newAddress; Needs = @($addressOperation) }) + $ttlSubjects
                 }
@@ -860,7 +909,7 @@
                         foreach ($node in @($ptrNodes[$record['Data']])) {
                             foreach ($ptrRecord in @($node['Ptrs'])) {
                                 if ($ptrRecord['Data'] -eq $record['Owner']) {
-                                    @{ Record = $ptrRecord; Current = $ptrRecord['Data']; Needs = @() }
+                                    @{ Record = $ptrRecord; Current = $ptrRecord['Data']; Needs = @(); PtrAddress = $record['Data'] }
                                 }
                             }
                         }
@@ -871,9 +920,11 @@
             $ttlOperations = @(
                 foreach ($subject in $ttlSubjects) {
                     $record = $subject['Record']
+                    # PtrAddress: the address whose A/AAAA record this PTR belongs to,
+                    # for the re-check after a TTL change without WMI.
                     $ttlOperation = @{
                         Action = 'SetTtl'; Name = $record['Owner']; Type = $record['Type']; Data = $subject['Current']; Zone = $record['Zone']; NodeName = $record['NodeName']
-                        Before = $record; Write = 'Set'; RRType = $record['Type']; Current = $subject['Current']; NewTtl = $TTL; Needs = $subject['Needs']
+                        Before = $record; Write = 'Set'; RRType = $record['Type']; Current = $subject['Current']; NewTtl = $TTL; Needs = $subject['Needs']; PtrAddress = $subject['PtrAddress']
                         Summary = "set the TTL of $($record['Type']) $($record['Owner']) from $($record['Ttl']) to $TTL s"
                     }
                     if ($record['Ttl'] -eq $TTL) {
@@ -929,20 +980,30 @@
             }
 
             # A sub-operation whose prerequisite will not run does not run either; it
-            # must not be offered at the prompt.
-            foreach ($operation in $operations) {
-                if ($null -ne $operation['Result']) {
-                    continue
-                }
-                foreach ($need in @($operation['Needs'])) {
-                    $needResult = $need['Result']
-                    if ($null -ne $needResult -and $needResult -ne 'AlreadyDone') {
-                        $operation['Result'] = 'Skipped'
-                        $operation['Error'] = "Not done because $($need['Action']) of '$($need['Name'])' was $($needResult.ToLowerInvariant())."
-                        break
+            # must not be offered at the prompt. PlannedWith ties an old PTR removal
+            # to the address change it prepares: it runs first, but only when that
+            # change will run. Repeated until nothing changes, because a skip can
+            # travel backwards through PlannedWith and forwards through Needs.
+            do {
+                $planChanged = $false
+                foreach ($operation in $operations) {
+                    if ($null -ne $operation['Result']) {
+                        continue
+                    }
+                    foreach ($need in (@($operation['Needs']) + @($operation['PlannedWith']))) {
+                        if ($null -eq $need) {
+                            continue
+                        }
+                        $needResult = $need['Result']
+                        if ($null -ne $needResult -and $needResult -ne 'AlreadyDone') {
+                            $operation['Result'] = 'Skipped'
+                            $operation['Error'] = "Not done because $($need['Action']) of '$($need['Name'])' was $($needResult.ToLowerInvariant())."
+                            $planChanged = $true
+                            break
+                        }
                     }
                 }
-            }
+            } while ($planChanged)
 
             # --- Gate: one confirmation per item ---
             $pending = @(foreach ($operation in $operations) { if ($null -eq $operation['Result']) { $operation } })
@@ -962,13 +1023,21 @@
             }
 
             # --- Execute in order; every sub-operation gives exactly one Result ---
-            foreach ($operation in $operations) {
+            # An index loop: a TTL change without WMI may insert the re-creation of a
+            # PTR that the server deleted right after the current sub-operation.
+            for ($operationIndex = 0; $operationIndex -lt $operations.Count; $operationIndex++) {
+                $operation = $operations[$operationIndex]
+                # A SetTtl of a PTR that the server deleted became RemovePtr + AddPtr.
+                if ($operation['Replaced']) {
+                    continue
+                }
                 $result = $operation['Result']
                 $errorText = $operation['Error']
                 $failureReason = $null
                 $failureCategory = $null
                 $isUnreachable = $false
                 $after = $null
+                $ttlByCmdlet = $false
 
                 if ($result -eq 'Failed') {
                     if ($operation['Report']) {
@@ -1013,7 +1082,27 @@
                             if ($null -ne $operation['NewData']) {
                                 $setParameters['NewData'] = $operation['NewData']
                             }
+                            # A TTL change alone goes through WMI, over the batch's CIM
+                            # session (cached like the reference check's); without WMI
+                            # it goes through the DnsServer cmdlet (CONTRACTS.md 7.5, 13.6).
+                            $isTtlOnly = $null -ne $operation['NewTtl'] -and $null -eq $operation['NewData']
+                            if ($isTtlOnly -and $wmiUnavailable) {
+                                $setParameters['UseDnsServerCmdlet'] = $true
+                            }
+                            elseif ($isTtlOnly) {
+                                if ($null -eq $batch['CimSession']) {
+                                    $batch['CimSession'] = Get-DnsCimSession -Server $serverKey -Credential $Credential -TimeoutSec $TimeoutSec
+                                }
+                                $setParameters['CimSession'] = $batch['CimSession']
+                            }
                             $outcome = Set-DnsLiveRecord @setParameters
+                            if ($isTtlOnly -and [string]$outcome['ErrorId'] -eq 'DnsTools.Set-DnsLiveRecord.WmiUnavailable') {
+                                Write-Verbose "$($outcome['Error']) TTL changes use Set-DnsServerResourceRecord for the rest of this run."
+                                $wmiUnavailable = $true
+                                $setParameters['UseDnsServerCmdlet'] = $true
+                                $outcome = Set-DnsLiveRecord @setParameters
+                            }
+                            $ttlByCmdlet = $isTtlOnly -and $setParameters['UseDnsServerCmdlet'] -eq $true
                             if ($null -eq $outcome['Error']) {
                                 $result = 'Success'
                                 $after = $outcome['Record']
@@ -1092,12 +1181,91 @@
                 # the error below ends the run, and the log must still show the failure.
                 Write-DnsResult -Batch $batch -Action $operation['Action'] -Name $operation['Name'] -Type $operation['Type'] -Data $operation['Data'] -Zone $operation['Zone'] -NodeName $operation['NodeName'] -Result $result -ErrorMessage $errorText -Before $operation['Before'] -After $after
                 $operation['Outcome'] = $result
+                $operation['After'] = $after
                 if ($null -ne $failureReason) {
                     Write-Error -Message $errorText -Category $failureCategory -ErrorId "DnsTools.Set-DnsEntry.$failureReason" -TargetObject $operation['Name']
                 }
 
                 if ($isUnreachable) {
-                    Write-Error -Message "The DNS server '$serverKey' cannot be reached ($errorText). The run was stopped after $itemCount item(s); check the server and run the command again." -Category ConnectionError -ErrorId 'DnsTools.Set-DnsEntry.ServerUnreachable' -TargetObject $serverKey -ErrorAction Stop
+                    Write-Error -Message "The DNS server '$serverKey' cannot be reached: $errorText The run was stopped; the remaining input was not processed. Check the server and run the command again." -Category ConnectionError -ErrorId 'DnsTools.Set-DnsEntry.ServerUnreachable' -TargetObject $serverKey -ErrorAction Stop
+                }
+
+                # --- A TTL change of an A/AAAA record through the DnsServer cmdlet ---
+                # Windows Server 2025 deletes the PTR records that point at the name,
+                # older servers keep them: read them again and act on what is there
+                # (CONTRACTS.md 13.6). Still there -> its own SetTtl runs later. Gone
+                # -> its SetTtl becomes RemovePtr (done by the server) + AddPtr with
+                # the new TTL; a PTR added earlier in this item is re-created too.
+                if ($ttlByCmdlet -and $result -eq 'Success' -and ($operation['Type'] -eq 'A' -or $operation['Type'] -eq 'AAAA')) {
+                    $hostAddress = $operation['Current']
+                    $hostOwner = $operation['Name']
+                    $slotGone = @{}
+                    $insertions = @(
+                        for ($otherIndex = 0; $otherIndex -lt $operations.Count; $otherIndex++) {
+                            $other = $operations[$otherIndex]
+                            if ($other['Type'] -ne 'PTR' -or $other['Replaced'] -or $other['Data'] -ne $hostOwner -or -not $other['Zone']) {
+                                continue
+                            }
+                            $isPendingTtl = $other['Action'] -eq 'SetTtl' -and $otherIndex -gt $operationIndex -and $other['PtrAddress'] -eq $hostAddress
+                            $isAddedPtr = $other['Action'] -eq 'AddPtr' -and $otherIndex -lt $operationIndex -and ($other['Outcome'] -eq 'Success' -or $other['Outcome'] -eq 'AlreadyDone') -and $hasAddress -and $hostAddress -eq $newAddress
+                            if (-not $isPendingTtl -and -not $isAddedPtr) {
+                                continue
+                            }
+
+                            $slotKey = $other['Zone'] + '|' + $other['NodeName']
+                            if ($slotGone.ContainsKey($slotKey)) {
+                                if ($isPendingTtl -and $slotGone[$slotKey]) {
+                                    $other['Replaced'] = $true
+                                }
+                                continue
+                            }
+                            $recheckErrors = $null
+                            $ptrsNow = @(Get-DnsLiveRecord -ServerParameter $serverParameter -ZoneName $other['Zone'] -NodeName $other['NodeName'] -RRType 'PTR' -ErrorVariable recheckErrors 2>$null)
+                            $recheckFailed = $false
+                            foreach ($recheckError in @($recheckErrors)) {
+                                if ($null -ne $recheckError -and $null -ne $recheckError.PSObject.Properties['FullyQualifiedErrorId'] -and [string]$recheckError.FullyQualifiedErrorId -like 'DnsTools.Get-DnsLiveRecord.LookupFailed*') {
+                                    $recheckFailed = $true
+                                }
+                            }
+                            $isStillThere = $false
+                            foreach ($ptrNow in $ptrsNow) {
+                                if ($null -ne $ptrNow -and $ptrNow['Data'] -eq $hostOwner) {
+                                    $isStillThere = $true
+                                }
+                            }
+                            if ($recheckFailed) {
+                                Write-Verbose "The PTR record $($other['Name']) could not be read again after the TTL change of '$hostOwner'; it is left as planned."
+                            }
+                            $isGone = -not $recheckFailed -and -not $isStillThere
+                            $slotGone[$slotKey] = $isGone
+                            if (-not $isGone) {
+                                continue
+                            }
+
+                            if ($isPendingTtl) {
+                                $other['Replaced'] = $true
+                            }
+                            $ptrBefore = $other['Before']
+                            if ($isAddedPtr -and $null -ne $other['After']) {
+                                $ptrBefore = $other['After']
+                            }
+                            @{
+                                Action = 'RemovePtr'; Name = $other['Name']; Type = 'PTR'; Data = $hostOwner; Zone = $other['Zone']; NodeName = $other['NodeName']
+                                Before = $ptrBefore; Result = 'Success'; Error = $serverDeletedText; Needs = @()
+                            }
+                            @{
+                                Action = 'AddPtr'; Name = $other['Name']; Type = 'PTR'; Data = $hostOwner; Zone = $other['Zone']; NodeName = $other['NodeName']
+                                Before = $null; Write = 'Add'; RRType = 'PTR'; Current = $hostOwner; AddTtl = $TTL; Needs = @()
+                            }
+                        }
+                    )
+                    if ($insertions.Count -gt 0) {
+                        if (-not $recreateWarned) {
+                            $recreateWarned = $true
+                            Write-Warning "root\MicrosoftDNS on '$serverKey' is not available; TTL changes of A/AAAA records re-create their PTR records."
+                        }
+                        $operations = @($operations | Select-Object -First ($operationIndex + 1)) + $insertions + @($operations | Select-Object -Skip ($operationIndex + 1))
+                    }
                 }
             }
         }

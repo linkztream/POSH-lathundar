@@ -307,7 +307,7 @@ RSAT-DNS-Server (Windows Server)."`
 ### 7.4 Name and address helpers
 
 ```powershell
-ConvertTo-DnsNormalizedName -Name <string>           # -> lower-case, trailing dot removed, \DDD escapes decoded as OCTAL (\040 -> ' ', \050 -> '('), surrounding whitespace trimmed; '' -> ''
+ConvertTo-DnsNormalizedName -Name <string>           # -> lower-case, trailing dot removed, \DDD escapes decoded as OCTAL BYTES, a run of them as one UTF-8 sequence (\040 -> ' ', r\303\244k -> 'räk'; an invalid byte -> one char, never throws; live fact 2026-10-13), surrounding whitespace trimmed; '' -> ''
                                                      # Windows DNS writes \DDD in OCTAL, not the decimal of RFC 1035. Verified 2026-10-09: a live PTR target
                                                      # 'iO Sense.lab.example.' was exported as 'iO\040Sense.lab.example.'. Decode d1*64 + d2*8 + d3 (no [Convert], it is blocked in CLM).
 ConvertTo-DnsNormalizedAddress -Address <string>     # -> canonical string or $null if not an IP. IPv4: dotted quad only, octets read as DECIMAL ('010.0.0.1' -> '10.0.0.1'; note the [ipaddress] cast would read it as octal 8.0.0.1 and would accept '10.1' and '12345'). IPv6: through [ipaddress], compressed lower-case
@@ -370,6 +370,9 @@ Remove-DnsLiveRecord -ServerParameter <hashtable> -ZoneName <string> -NodeName <
 # Get-DnsServerResourceRecord -Node -RRType, keep the record whose normalised Data equals -Data, pipe it to
 # Remove-DnsServerResourceRecord -ZoneName -Force -WhatIf:$false -Confirm:$false. Pipeline form ONLY: the -Name/-RRType/-RecordData form
 # removes the record but reports a false error on Server 2022/2025. No matching record, or 9701 / 9714 from the cmdlet -> AlreadyGone.
+# LIVE FACT (labdc01, Server 2025, 2026-10-13): removing an A/AAAA record by ANY path (this cmdlet, WMI Remove-CimInstance, dnscmd
+#   /recorddelete) makes the server delete the PTR record that points at the record's name; a PTR pointing at another name survives.
+#   The helper does nothing about it; the callers order PTR before A (§13.4) and Remove-DnsEntry re-checks after -KeepPtr.
 # Unreachable = Test-DnsConnectionError on the failing error record (§13.9: the caller ends the batch).
 
 Add-DnsLiveRecord -ServerParameter <hashtable> -ZoneName <string> -NodeName <string> -RRType <A|AAAA|CNAME|PTR> -Data <string> [-Ttl <int>]
@@ -379,8 +382,20 @@ Add-DnsLiveRecord -ServerParameter <hashtable> -ZoneName <string> -NodeName <str
 # Re-reads the record after the add. FullyQualifiedErrorId (winerror.h, §13.9): 9711 -> AlreadyExists (Record = the existing record);
 # 9708 or 9709 -> CnameConflict; anything else -> Failed with the cmdlet's message, Unreachable set by Test-DnsConnectionError.
 
-Set-DnsLiveRecord -ServerParameter <hashtable> -ZoneName <string> -NodeName <string> -RRType <string> -Data <string> [-NewTtl <int>] [-NewData <string>]
+Set-DnsLiveRecord -ServerParameter <hashtable> -ZoneName <string> -NodeName <string> -RRType <string> -Data <string> [-NewTtl <int>] [-NewData <string>] [-CimSession <object>]
 # -> @{ Record=<hashtable>|$null; Error; ErrorId; Unreachable=[bool] }
+# LIVE FACTS (labdc01, 2026-10-13): Set-DnsServerResourceRecord on an A/AAAA record (TTL or data) DELETES the PTR record that points at
+#   the record's name (a PTR pointing elsewhere survives); the WMI method MicrosoftDNS_<Type>.Modify(TTL) in root\MicrosoftDNS changes
+#   the TTL without touching the PTR, but Modify(IPAddress) deletes it like the cmdlet. Neither method keeps the aging Timestamp: every
+#   change makes the record static. Therefore:
+#   - -NewTtl alone: Invoke-CimMethod -MethodName Modify -Arguments @{ TTL = [uint32]$NewTtl } on the instance selected with
+#     SELECT * FROM MicrosoftDNS_<AType|AAAAType|CNAMEType|PTRType> WHERE ContainerName='<zone>' AND OwnerName='<fqdn>' [AND <prop>='<data>']
+#     over -CimSession (Get-DnsCimSession; the batch caches it in $Batch.CimSession). No session, or the provider refuses -> Error with
+#     ErrorId DnsTools.Set-DnsLiveRecord.WmiUnavailable and nothing changed. With -UseDnsServerCmdlet the TTL goes through
+#     Set-DnsServerResourceRecord instead (the server then deletes the matching PTR; the caller re-creates it, §13.6), so the module
+#     works without root\MicrosoftDNS too (WMIC is deprecated, WMI/CIM is not, but a namespace ACL can still block it).
+#   - -NewData (with or without -NewTtl): Set-DnsServerResourceRecord as below; the CALLER removes the old PTR first and adds the new one
+#     afterwards (§13.6), so the server's implicit deletion never hits a PTR that is still wanted or unlogged.
 # Fetches the record TWICE with Get-DnsServerResourceRecord -Node -RRType (two independent CimInstances; .Clone() is blocked in CLM and missing on 7),
 # picks the one whose Data matches, sets TimeToLive (New-TimeSpan -Seconds) and/or RecordData.IPv4Address | IPv6Address | HostNameAlias | PtrDomainName
 # as a STRING on the second copy, then Set-DnsServerResourceRecord -ZoneName -OldInputObject $old -NewInputObject $new -WhatIf:$false -Confirm:$false.
@@ -529,7 +544,8 @@ six fields (`"`t"` joined):
 OWNER   TYPE   DATA   TTL   AGE   ADDR
 ```
 - `OWNER`: owner FQDN, lower-case, no trailing dot, `\DDD` decoded as
-  **octal** (Windows writes `\040` for a space; see §7.4). Apex
+  **octal bytes**, a run of them as UTF-8 (Windows writes `\040` for a space and
+  `r\303\244k` for `räk`; see §7.4). Apex
   = the zone name. Continuation lines (leading whitespace, no owner)
   inherit the previous owner. `$ORIGIN` switches the suffix; relative names
   get the current origin appended; absolute names (trailing dot) are used
@@ -922,6 +938,14 @@ Errors: `PatternNotAllowed`, `ZoneNotFound` per item (non-terminating);
 unreachable server or `Confirm.NonInteractive` → terminating after the
 first occurrence (§5.8).
 
+`-KeepPtr` on a server that deletes the PTR with the A record (live fact,
+§13.9): after `RemoveA`/`RemoveAAAA` the expected PTR is read again; when it
+is gone, one Result `RemovePtr` with `Result = Success` and Error
+`"Removed by the DNS server together with the A record; -KeepPtr cannot be
+honoured on this server."` is written (Before from the read before the
+removal) and one warning per run says the same. DnsTools never re-creates
+the PTR.
+
 ### 13.5 `New-DnsEntry` (phase 2)
 
 ```powershell
@@ -968,6 +992,17 @@ Set-DnsEntry [-Identity <object[]>] [-Zone <string>] [-TTL <int>] [-Address <str
 ```
 Impact: `-Address` `High`, the others `Medium`.
 - Requested value equals the current value → `AlreadyDone`.
+- `-TTL` on an A/AAAA record without WMI (`WmiUnavailable`): retry with
+  `Set-DnsLiveRecord -UseDnsServerCmdlet`; afterwards the PTR that pointed
+  at the name is gone (live fact), so the PTR's `SetTtl` becomes `RemovePtr`
+  (`Success`, Error `"Removed by the DNS server together with the A record
+  change."`, Before from the earlier read) plus `AddPtr` with the new TTL.
+  One warning per run: `"root\MicrosoftDNS on '<server>' is not available;
+  TTL changes of A/AAAA records re-create their PTR records."`
+- Order for `-Address`: `RemovePtr` (the old PTR, when it points at the
+  name) → `SetAddress` → `AddPtr`, because the server deletes the matching
+  PTR as a side effect of the address change (live fact in §7.5); the
+  explicit removal first keeps the log complete.
 - `-TTL`: every A/AAAA/CNAME at the node (the exact record when the input
   is an Entry) and every PTR that points at the name → `SetTtl` each, in
   place (`Set-DnsLiveRecord`).
@@ -1055,6 +1090,19 @@ abort (acceptable: the command only reads).
   reminds about `Update-DnsSnapshot`.
 - `Confirm.NonInteractive` or an unreachable server on the first item →
   terminating error (§5.8); no per-item repetition.
+- Live facts 2026-10-13 (labdc01, Windows Server 2025): a change OR a
+  removal of an A/AAAA record by any path deletes the PTR that points at
+  the name (§7.5 Remove-/Set-DnsLiveRecord). This is VERSION-DEPENDENT:
+  older servers commonly leave the PTR behind (the operator's production
+  domains are full of such orphans), so the code never assumes either
+  way: after a removal or a cmdlet-path change of an A/AAAA record it
+  re-reads the expected PTR and acts on what is there (§13.4, §13.6); the server accepted a CNAME
+  that points at itself (no 9707), so loops are not detected in phase 2;
+  a change of an A/AAAA record through
+  `Set-DnsServerResourceRecord` deletes the PTR that points at the name;
+  TTL changes therefore go through WMI `Modify` (§7.5). Every change
+  clears the aging timestamp: a dynamic record changed with
+  `-IncludeDynamic` becomes static, and the help says so.
 - Error codes (classified on `FullyQualifiedErrorId`; values checked
   against winerror.h 2026-10-11, which cmdlet raises which is confirmed in
   the live test): 9701 record missing and 9714 name missing (removal →

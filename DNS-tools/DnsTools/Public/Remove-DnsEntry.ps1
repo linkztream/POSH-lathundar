@@ -87,7 +87,11 @@
 
     .PARAMETER KeepPtr
         Do not remove PTR records. A name is then removed even though its PTR
-        records stay; no Result is written for them.
+        records stay; no Result is written for them. Windows Server 2025 deletes
+        the PTR record that points at a name together with its A or AAAA record,
+        so there -KeepPtr cannot be honoured: the PTR records are read again after
+        the removal, and each one that is gone gets a RemovePtr result (Success,
+        with a note in Error) and the run gives one warning.
 
     .PARAMETER KeepAlias
         Do not remove the CNAME aliases that point at a removed name.
@@ -221,6 +225,16 @@
           -Confirm:$false in unattended runs). Other failures are
           non-terminating errors (DnsTools.Remove-DnsEntry.<Reason>) with a
           Failed Result, and the run goes on.
+        - PTR records and -KeepPtr: Windows Server 2025 deletes the PTR record
+          that points at a name when its A or AAAA record is removed, by any tool
+          (verified on 2026-10-13); older servers keep it. Remove-DnsEntry removes
+          the PTR records first anyway, so the log names each of them. With
+          -KeepPtr the PTR records are read again after each removed A or AAAA
+          record: one that is still there is left alone, one that the server
+          deleted gets a RemovePtr result with Result Success and the Error
+          "Removed by the DNS server together with the A record; -KeepPtr cannot
+          be honoured on this server.", plus one warning per run. Remove-DnsEntry
+          never re-creates such a PTR record.
         - Only the default zone scope is changed; a zone with more zone scopes
           gives one warning.
         - The local snapshot is not updated; run Update-DnsSnapshot afterwards
@@ -317,6 +331,8 @@
         $actionByType = @{ A = 'RemoveA'; AAAA = 'RemoveAAAA'; CNAME = 'RemoveCName'; PTR = 'RemovePtr'; DHCID = 'RemoveDhcid' }
         $readOnlyText = "Zone '{0}' is not writable on this server ('{1}' holds it as a {2} zone). Remove the record on the server that hosts the primary zone."
         $unavailableText = "The reference check could not run (root\MicrosoftDNS on '$serverKey' is not reachable). Run Update-DnsSnapshot first, or pass -SkipReferenceCheck."
+        $keepPtrText = 'Removed by the DNS server together with the A record; -KeepPtr cannot be honoured on this server.'
+        $keepPtrWarned = $false
         $lookupFailedPrefix = 'DnsTools.Get-DnsLiveRecord.LookupFailed'
 
         # The snapshot index is loaded on the first address item only, and only
@@ -1120,6 +1136,7 @@
                 }
 
                 # --- 7. Execute, one Result per sub-operation ---
+                $keepPtrChecked = @{}
                 $groupState = @{}
                 foreach ($group in $groups) {
                     $groupState[$group['Key']] = @{ Fqdn = $group['Fqdn']; PtrFailed = $false; AddressKept = $false; NameKept = $false }
@@ -1201,6 +1218,52 @@
                     }
 
                     Write-DnsResult -Batch $Batch -Action $actionByType[$record['Type']] -Name $record['Owner'] -Type $record['Type'] -Data $record['Data'] -Zone $record['Zone'] -NodeName $record['NodeName'] -Result $resultValue -ErrorMessage $errorText -Before $before
+
+                    # -KeepPtr: Windows Server 2025 deletes the PTR that points at the
+                    # name together with the A/AAAA record, older servers keep it. Read
+                    # the PTR records found before the removal again and report the ones
+                    # that are gone (CONTRACTS.md 13.4); never assume either way.
+                    if ($KeepPtr -and $phase -eq 'Address' -and $resultValue -eq 'Success') {
+                        foreach ($ptrRecord in @($ptrsByAddress[$record['Data']])) {
+                            if ($null -eq $ptrRecord -or $ptrRecord['Data'] -ne $record['Owner']) {
+                                continue
+                            }
+                            $ptrKey = $ptrRecord['Zone'] + '|' + $ptrRecord['NodeName'] + '|' + $ptrRecord['Data']
+                            if ($keepPtrChecked.ContainsKey($ptrKey)) {
+                                continue
+                            }
+                            $keepPtrChecked[$ptrKey] = $true
+
+                            $readErrors = $null
+                            $ptrsNow = @(Get-DnsLiveRecord -ServerParameter $serverParameter -ZoneName $ptrRecord['Zone'] -NodeName $ptrRecord['NodeName'] -RRType 'PTR' -ErrorVariable readErrors 2>$null)
+                            $readFailed = $false
+                            foreach ($readError in @($readErrors)) {
+                                if ($null -ne $readError -and $null -ne $readError.PSObject.Properties['FullyQualifiedErrorId'] -and ([string]$readError.FullyQualifiedErrorId).StartsWith($lookupFailedPrefix)) {
+                                    $readFailed = $true
+                                }
+                            }
+                            if ($readFailed) {
+                                Write-Verbose "The PTR record $($ptrRecord['Owner']) could not be read again after the removal of '$($record['Owner'])' ($($record['Data']))."
+                                continue
+                            }
+                            $isStillThere = $false
+                            foreach ($ptrNow in $ptrsNow) {
+                                if ($null -ne $ptrNow -and $ptrNow['Data'] -eq $ptrRecord['Data']) {
+                                    $isStillThere = $true
+                                }
+                            }
+                            if ($isStillThere) {
+                                Write-Verbose "The PTR record $($ptrRecord['Owner']) -> $($ptrRecord['Data']) is kept (-KeepPtr)."
+                                continue
+                            }
+
+                            Write-DnsResult -Batch $Batch -Action 'RemovePtr' -Name $ptrRecord['Owner'] -Type 'PTR' -Data $ptrRecord['Data'] -Zone $ptrRecord['Zone'] -NodeName $ptrRecord['NodeName'] -Result 'Success' -ErrorMessage $keepPtrText -Before $ptrRecord
+                            if (-not $keepPtrWarned) {
+                                $keepPtrWarned = $true
+                                Write-Warning $keepPtrText
+                            }
+                        }
+                    }
 
                     if ($null -ne $failure) {
                         if ($failure['Unreachable']) {

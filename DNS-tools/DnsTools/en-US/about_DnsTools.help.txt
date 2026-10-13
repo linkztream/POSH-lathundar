@@ -2,21 +2,23 @@
     about_DnsTools
 
 SHORT DESCRIPTION
-    Explains how DnsTools finds and checks DNS records in very large zones:
-    snapshots, PTR status, the confirmation gate, the change log, the
-    automation contract and Constrained Language Mode.
+    Explains how DnsTools finds, checks and changes DNS records in very
+    large zones: snapshots, PTR status, the change commands, the confirmation
+    gate, the change log, the automation contract and Constrained Language
+    Mode.
 
 LONG DESCRIPTION
-    DnsTools is a PowerShell module for finding, auditing and, in later
-    phases, repairing, creating and removing A, AAAA, PTR and CNAME records in
-    large, messy Microsoft DNS (Active Directory-integrated) environments.
+    DnsTools is a PowerShell module for finding, auditing, creating, changing
+    and removing A, AAAA, PTR and CNAME records and, in a later phase,
+    repairing them in large, messy Microsoft DNS (Active Directory-integrated)
+    environments.
     This topic explains the ideas behind the commands. For the syntax and
     examples of one command, use Get-Help <command> -Full.
 
     WHAT IS NEW IN THIS VERSION
 
-        This version is phase 1 of the plan: the foundation and the read-only
-        commands. It has three commands and changes nothing in DNS.
+        This version is phase 2 of the plan: the five change commands on top
+        of the read-only commands of phase 1. It has eight commands.
 
         Get-DnsEntry
             Finds A, AAAA and CNAME records by name, address or pattern and
@@ -31,13 +33,15 @@ LONG DESCRIPTION
             Exports zones from a DNS server into the local snapshot and
             rebuilds the search index. It writes local files only.
 
-        The commands that change records (Remove-DnsEntry, New-DnsEntry,
-        Set-DnsEntry, Repair-DnsIssue) and the consistency audit
-        (Get-DnsIssue) are planned for later phases. Where this topic
-        describes how change commands behave (the confirmation gate, the
-        change log, Result objects), that is how they are planned to behave
-        and the text says so. No command in this version writes to the
-        change log.
+        Remove-DnsEntry, New-DnsEntry, Set-DnsEntry, New-DnsReverseZone,
+        Backup-DnsZone
+            The change commands, described under CHANGE COMMANDS. Four of
+            them change DNS. Backup-DnsZone changes no DNS record; it writes
+            zone files on the local computer.
+
+        The consistency audit (Get-DnsIssue) and the repair command
+        (Repair-DnsIssue) are planned for phase 3, Undo-DnsChange for
+        phase 4. They do not exist in this version.
 
     WHY THE TOOL EXISTS
 
@@ -121,9 +125,10 @@ LONG DESCRIPTION
         for the PowerShell session. Update-DnsSnapshot rebuilds it; in a new
         session the first snapshot search reads the files again.
 
-        Commands that change DNS (planned) will read the record live
-        immediately before acting. A snapshot will never be the basis for a
-        change.
+        Commands that change DNS read the record live immediately before
+        acting. A snapshot is never the basis for a change, and a change does
+        not update the snapshot: snapshot searches show the state at export
+        time, so run Update-DnsSnapshot before you search again.
 
     PTR STATUS VALUES
 
@@ -204,45 +209,119 @@ LONG DESCRIPTION
         of Ok, and a delegated PTR shows as Missing. Run Update-DnsSnapshot
         first when this matters.
 
+    CHANGE COMMANDS
+
+        Remove-DnsEntry
+            Removes A, AAAA and CNAME records together with their PTR
+            records, DHCID record and CNAME aliases. Impact High: it asks
+            once for every input item.
+        New-DnsEntry
+            Creates static A, AAAA and CNAME records, with the PTR record of
+            each address. Impact Medium. Creating a reverse zone
+            (-CreateReverseZone) is a separate step with impact High.
+        Set-DnsEntry
+            Changes the TTL, the address, the PTR target or the alias target
+            of existing records in place. Impact High with -Address, Medium
+            otherwise.
+        New-DnsReverseZone
+            Creates an Active Directory-integrated reverse lookup zone with
+            the settings of an existing zone. Impact High.
+        Backup-DnsZone
+            Saves zones as zone files in a new time-stamped folder, with a
+            RESTORE.md. Impact Low. It changes no DNS record.
+
+        What they have in common:
+
+        - Each item is read live from the server immediately before it is
+          changed.
+        - Names and addresses are exact. Patterns (* and ?) are refused. An
+          entry piped in from Get-DnsEntry names exactly one record.
+        - -WhatIf, -Confirm and -Force work as described under THE
+          CONFIRMATION GATE.
+        - Every sub-operation produces one DnsTools.Result object and one
+          line in the change log.
+        - A safety check has its own switch, and -Force never switches one
+          off: -AllowReferenced and -SkipReferenceCheck (Remove-DnsEntry),
+          -IncludeDynamic (Set-DnsEntry) and -ReplacePtr (New-DnsEntry,
+          Set-DnsEntry).
+
+        Order of the sub-operations:
+
+        - Remove-DnsEntry removes the PTR records that point at the name
+          (RemovePtr) first, then the A and AAAA records (RemoveA,
+          RemoveAAAA), then the DHCID record (RemoveDhcid, only when no A or
+          AAAA record is left), then the CNAME aliases that point at the name
+          (RemoveCName; not with -KeepAlias). When a PTR record in a writable
+          zone cannot be removed, the A and AAAA records are kept, so that no
+          PTR record is left without its host.
+        - New-DnsEntry runs a preflight for an item before it writes
+          anything: the name is not an alias, an alias has no other record at
+          its name, no NS record delegates a label above the name, and a
+          reverse zone covers each address. If one check fails nothing of
+          the item is written. Then it creates the reverse zone if wanted
+          (CreateZone, SetZoneAging), then the A and AAAA records or the
+          CNAME (AddA, AddAAAA, AddCName), then the PTR records (AddPtr;
+          with -ReplacePtr a RemovePtr comes first).
+        - Set-DnsEntry -Address does RemovePtr (the old PTR record),
+          SetAddress, then AddPtr. -TTL does SetTtl on the records of the
+          name, then on the PTR records that point at it.
+        - New-DnsReverseZone does CreateZone, then SetZoneAging.
+        - Backup-DnsZone writes one Backup result per zone, then RESTORE.md.
+
     THE CONFIRMATION GATE
 
         Every command that changes state decides whether to proceed through
-        one internal gate. In this version only Update-DnsSnapshot uses it;
-        the change commands will use the same gate. The rules are applied in
-        this order.
+        one internal gate. Update-DnsSnapshot and the change commands use
+        it. The rules are applied in this order.
 
         1.  -WhatIf: the gate prints a line such as: What if: Performing the
             operation "<action>" on target "<target>". For example: What if:
-            Performing the operation "Export DNS zones to local snapshot" on
-            target "2 zone(s) on dc01". It then does nothing. (Commands that
-            write the change log will log the attempt with Result = WhatIf.)
-        2.  -Force, or an earlier answer of A (yes to all) in the same command
-            run: the action proceeds without a question.
+            Performing the operation "Remove DNS records" on target
+            "srv01-old.contoso.local: remove 1 PTR, 1 A". It then does
+            nothing. The change commands still log the attempt and return
+            their Result objects with Result = WhatIf.
+        2.  -Force, or an earlier answer of A (yes to all) at the same
+            impact level in the same command run: the action proceeds
+            without a question.
         3.  Otherwise the gate asks only if $ConfirmPreference is not None and
             the impact of the action (Low, Medium or High) is at least
             $ConfirmPreference. By default $ConfirmPreference is High, so only
             High-impact actions ask. -Confirm lowers it to Low, so every
             action asks. -Confirm:$false sets it to None, so nothing asks. An
-            action below the threshold proceeds without a question.
-            Update-DnsSnapshot has impact Low and asks once for the whole
-            export (not once per zone), so it asks only with -Confirm.
+            action below the threshold proceeds without a question. The
+            impacts are:
+            High    Remove-DnsEntry (one question for every input item),
+                    New-DnsReverseZone, the creation of a reverse zone by
+                    New-DnsEntry -CreateReverseZone (one question for every
+                    zone), Set-DnsEntry with -Address
+            Medium  New-DnsEntry, Set-DnsEntry without -Address
+            Low     Update-DnsSnapshot (one question for the whole export,
+                    not one per zone), Backup-DnsZone (one question for the
+                    whole run)
+            A step that is already in place never asks: the question is
+            shown only when something is to be written.
         4.  The question is shown like this:
 
-                Export DNS zones to local snapshot
-                  2 zone(s) on dc01
+                Remove DNS records
+                  srv01-old.contoso.local: remove 1 PTR, 1 A
                 [Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N)
 
-            Y (or yes) approves this action. N skips it. A (or all) approves
-            this action and all later actions of the same command run. S (or
-            stop) stops the whole operation with the error "Operation stopped
-            by the operator." Upper or lower case does not matter. Any other
-            answer, including just pressing Enter, counts as N.
+            Y (or yes) approves this action. N skips it: every pending
+            sub-operation of the item is Skipped with the error "Declined at
+            the confirmation prompt." and is logged. A (or all) approves this
+            action and all later actions of the same impact level in the
+            same command run; an A at a Medium question never approves a
+            High action such as creating a zone. S (or stop) stops the whole
+            operation with the error "Operation stopped by the operator."
+            Upper or lower case does not matter. Any other answer, including
+            just pressing Enter, counts as N.
         5.  If the session cannot ask (a scheduled task, -NonInteractive, a
-            remote session without a console), the action is not performed and
-            the error "This session cannot prompt. Re-run with -Force to
+            remote session without a console), the action is not performed
+            and the error "This session cannot prompt. Re-run with -Force to
             confirm all actions, or -WhatIf to preview." is written (ErrorId
-            DnsTools.Confirm.NonInteractive). Use -Force for unattended
-            runs.
+            DnsTools.Confirm.NonInteractive). A change command ends its run
+            with this one error and does not repeat it for every item. Use
+            -Force for unattended runs.
 
         Update-DnsSnapshot writes only local files. With -WhatIf it reads the
         zone list from the server, prints one "What if" line and exports
@@ -251,11 +330,12 @@ LONG DESCRIPTION
 
     THE CHANGE LOG
 
-        No command in this version writes to the change log, and none has a
-        -LogPath parameter. The log writer exists so that the planned change
-        commands can use it. They will write each action to the log as one
-        line of compact JSON (JSON Lines). -WhatIf runs will be logged too,
-        with Result = WhatIf, so a rehearsal can be reviewed afterwards.
+        Remove-DnsEntry, New-DnsEntry, Set-DnsEntry, New-DnsReverseZone and
+        Backup-DnsZone write each sub-operation to the change log as one line
+        of compact JSON (JSON Lines). They have a -LogPath parameter.
+        -WhatIf runs are logged too, with Result = WhatIf, so a rehearsal can
+        be reviewed afterwards, and so are skipped and failed sub-operations.
+        Get-DnsEntry, Get-DnsSnapshot and Update-DnsSnapshot write no log.
 
         The log file is chosen in this order: the -LogPath parameter; the
         environment variable DNSTOOLS_LOGPATH;
@@ -265,10 +345,22 @@ LONG DESCRIPTION
 
         Every line has these fields, in this order, always present, null when
         not applicable: Id, BatchId, Timestamp, Operator (DOMAIN\user),
-        Server, Action, Zone, NodeName, Type, Before (Data, Ttl, Timestamp,
-        IsStatic), After, Result and Error. BatchId is shared by all lines
-        written by one command run. Result is one of Success, Failed,
-        Skipped, WhatIf, AlreadyDone, Pending.
+        Server, Action, Zone, NodeName, Name, Type, Data, Before, After,
+        Result and Error. Id is also the Id of the Result object. BatchId is
+        shared by all lines written by one command run. Name is the owner of
+        the record as an FQDN (for a PTR record the reverse name) and Data the
+        address or target the step is about, so a line without Before and
+        After still says which record it concerns. Result is one of Success,
+        Failed, Skipped, WhatIf, AlreadyDone, Pending.
+
+        Before and After hold Data, Ttl, Timestamp (null for a static record)
+        and IsStatic of the record. Remove steps have Before, the record that
+        was removed, on Success. Add steps have After, the new record read
+        back from the server, on Success; AlreadyDone has Before, the record
+        that was already there. Set steps have Before, the record as it was
+        read, also when they are skipped or failed, and After, read back
+        after the change, on Success. CreateZone, SetZoneAging and Backup
+        have neither.
 
         Writing the log never throws. If the file is locked, the module waits
         200 milliseconds and tries once more. If that fails too, it writes the
@@ -278,40 +370,83 @@ LONG DESCRIPTION
         Encoding: Windows PowerShell 5.1 writes a UTF-8 byte-order mark (BOM)
         when it creates the file and PowerShell 7 does not. A BOM is never
         written in the middle of a file and both editions read either form. To
-        read the log:
+        read the log, and to find one run by its BatchId:
 
-            Get-Content -Encoding UTF8 <file> | ConvertFrom-Json |
-                Where-Object Result -eq Failed
+            $lines = Get-Content -Encoding UTF8 <file> | ConvertFrom-Json
+            $lines | Where-Object Result -eq Failed
+            $lines | Where-Object BatchId -eq $lines[-1].BatchId
+
+        Undo-DnsChange, which will read the log, is planned for phase 4.
+
+    SERVER BEHAVIOUR AND LIMITS OF THE CHANGE COMMANDS
+
+        These facts were measured on a Windows Server 2025 domain controller
+        on 2026-10-13. Other server versions were not tested.
+
+        - PTR records. On that server the PTR record that points at an A
+          record's name is deleted whenever the A record is removed or
+          changed, by any method. Older servers commonly leave it. DnsTools
+          removes PTR records first itself, reads them again afterwards and
+          reports what the server did. Remove-DnsEntry -KeepPtr may be
+          overruled by the server: the PTR record then gets a RemovePtr
+          result with Result = Success and an explanation, and one warning.
+          DnsTools never re-creates such a PTR record.
+        - Every change makes a record static. The server clears the aging
+          timestamp of a changed record, also with -IncludeDynamic.
+          Before.Timestamp in the log keeps the old one. The client or the
+          DHCP server may register a dynamic record again.
+        - TTL changes go through WMI (root\MicrosoftDNS, method Modify),
+          which leaves the PTR record alone. Without WMI access Set-DnsEntry
+          changes the TTL with Set-DnsServerResourceRecord, adds the PTR
+          records again (a RemovePtr and an AddPtr result) and warns. That
+          fallback is tested against stand-ins, not against a live server.
+        - The server accepts a CNAME that points at itself. DnsTools does not
+          detect alias loops in this version.
+        - Snapshots are not patched after a change. Snapshot searches show the
+          state at export time.
+        - New-DnsReverseZone, and New-DnsEntry -CreateReverseZone, create
+          IPv4 zones for /8, /16 and /24 networks and IPv6 zones on a nibble
+          boundary only. Classless (RFC 2317) reverse zones are not created;
+          New-DnsEntry puts a PTR record into one that the server hosts.
+        - -Delay waits whole seconds, once for every input item.
 
     THE AUTOMATION CONTRACT
 
         The module is written to be called from scheduled scripts. These rules
-        hold for every public command, unless a rule says "planned".
+        hold for every public command.
 
         1.  Objects out, never text. Commands emit typed objects
-            (DnsTools.Entry, DnsTools.Snapshot; DnsTools.Result from
-            the planned change commands). Write-Host is used only for the
-            "What if:" lines. Objects are streamed as they are produced,
-            never collected into an array first.
+            (DnsTools.Entry, DnsTools.Snapshot and, from the change
+            commands, DnsTools.Result). Write-Host is used only for the
+            "What if:" lines and the confirmation question. Objects are
+            streamed as they are produced, never collected into an array
+            first.
         2.  Terminating errors are used only for preconditions that make the
             whole call pointless. In this version: no default server
             (LOGONSERVER not set) or an invalid server name; the DnsServer
             module is missing; the zone list of the server cannot be read;
             -Credential was given but no CIM session is possible; the
             snapshot metadata cannot be written; a search needs a snapshot
-            and not one zone could be exported. The message ends with what to
-            do. They are terminating whatever -ErrorAction you pass; use
-            try/catch to handle them.
+            and not one zone could be exported. The change commands add: a
+            server that cannot be reached (ErrorId
+            DnsTools.<Command>.ServerUnreachable, after the Failed Result of
+            the item concerned), a session that cannot prompt, the answer S
+            at a prompt, and a parameter combination that cannot work (for
+            example Set-DnsEntry with nothing to change). The batch ends with
+            this one error; it is not repeated for every item. The message
+            ends with what to do. They are terminating whatever
+            -ErrorAction you pass; use try/catch to handle them.
         3.  A failure of one item is a non-terminating error (ErrorId
             DnsTools.<Function>.<Reason>, the item as TargetObject) and the
             command continues with the next item. Update-DnsSnapshot reports
             ExportFailed (a zone whose export failed), ZoneNotFound and
             ZoneNotExportable (a requested zone). Get-DnsEntry reports
             ZoneNotFound, PatternWithExact (a wildcard together with -Exact)
-            and InvalidPattern. The planned change commands will add a Result
-            object with Result = Failed. -ErrorAction Stop turns the first
-            such error into a terminating one, so the script stops at the
-            first failed item.
+            and InvalidPattern. The change commands add a Result object with
+            Result = Failed, written before the error, so -ErrorAction Stop
+            still leaves the log line. Access denied is Failed, never
+            AlreadyDone. -ErrorAction Stop turns the first such error into a
+            terminating one, so the script stops at the first failed item.
         4.  Live lookups: a real failure (access denied, server unreachable)
             is a non-terminating error with the ErrorId
             DnsTools.Get-DnsLiveRecord.LookupFailed, and the search goes on
@@ -320,13 +455,16 @@ LONG DESCRIPTION
             found" answers of the DnsServer cmdlets in $Error and in a
             caller's -ErrorVariable, so do not use -ErrorVariable to decide
             whether a call failed. Capture the error stream with 2>&1 and
-            look for ErrorRecord objects, or (planned commands) read the
+            look for ErrorRecord objects, or (change commands) read the
             Result objects.
-        5.  Idempotent outcomes are successes. The planned change commands
-            will report Result = AlreadyDone when the wanted state already
-            held, so a script can be run again safely.
-        6.  -Force means zero prompts. Without it, an unattended session gets
-            the "This session cannot prompt" error instead of a hang.
+        5.  Idempotent outcomes are successes. The change commands report
+            Result = AlreadyDone when the wanted state already held (the
+            record is already gone, already there with the same data, the
+            value is already set, the zone is already hosted), so a script
+            can be run again safely.
+        6.  -Force means zero prompts, and nothing else: the safety checks
+            stay. Without it, an unattended session gets the "This session
+            cannot prompt" error instead of a hang.
         7.  Warnings (Write-Warning) mean degraded operation that still gives
             correct output: a stale snapshot used, a zone skipped, a snapshot
             file that could not be read. Capture them with -WarningVariable.
@@ -358,9 +496,13 @@ LONG DESCRIPTION
         ExportedAt, Age, IsReverse, ZoneType, ReplicationScope,
         DirectoryPartitionName, DynamicUpdate, AgingEnabled, FileSizeBytes and
         Path. The properties of an Entry are listed in Get-Help Get-DnsEntry
-        -Full. A Result object (planned change commands) will have these
-        properties, in this order: Action, Name, Type, Data, Result, Error,
-        Zone, NodeName, Server, Id, BatchId, Timestamp.
+        -Full. A Result object (the change commands) has these properties, in
+        this order: Action, Name, Type, Data, Result, Error, Zone, NodeName,
+        Server, Id, BatchId, Timestamp. Action is one of RemovePtr, RemoveA,
+        RemoveAAAA, RemoveCName, RemoveDhcid, AddA, AddAAAA, AddPtr,
+        AddCName, SetTtl, SetAddress, SetTarget, SetPtrTarget, CreateZone,
+        SetZoneAging and Backup. Skipped carries its reason in Error, as
+        Failed does.
 
     CONSTRAINED LANGUAGE MODE
 
@@ -381,11 +523,12 @@ LONG DESCRIPTION
         The core of DnsTools is designed to run in CLM. It builds its
         objects with New-Object PSObject instead of [PSCustomObject], calls no
         methods on non-core types, creates no .NET objects with constructors,
-        and does not use classes. The three commands of this version therefore
-        work in a constrained session; the module's smoke test runs them in a
-        Constrained Language runspace, against stand-ins for the DnsServer
-        cmdlets. The module records the language mode once, when it is
-        imported.
+        and does not use classes. The commands of this version therefore work
+        in a constrained session; the module's smoke test runs the read
+        commands and, under -WhatIf, Remove-DnsEntry, New-DnsEntry,
+        Set-DnsEntry and Backup-DnsZone in a Constrained Language runspace,
+        against stand-ins for the DnsServer cmdlets. The module records the
+        language mode once, when it is imported.
 
         Features marked "Full-language only" need a Full-language session. The
         only one planned is the owner lookup (-IncludeOwner and the Owner
@@ -440,6 +583,28 @@ LONG DESCRIPTION
           is not an error. After a "Lookup of ... failed" error it only means
           the lookup could not be done; fix that error first.
         - "This session cannot prompt": add -Force, or -WhatIf to preview.
+        - "Referenced by ... Add -AllowReferenced to remove it anyway.":
+          NS, SRV or MX records point at the name, so Remove-DnsEntry
+          skipped it. Remove those records first, or add -AllowReferenced.
+        - "The reference check could not run ...": there is no fresh
+          snapshot and no WMI access to root\MicrosoftDNS. Run
+          Update-DnsSnapshot, make WMI reachable, or pass
+          -SkipReferenceCheck.
+        - "No reverse lookup zone on '<server>' covers <address> ...":
+          New-DnsEntry created nothing. Add -NoPtr or -CreateReverseZone,
+          or create the zone with New-DnsReverseZone.
+        - "Dynamic record, owned by the client or the DHCP server ...":
+          Set-DnsEntry skips dynamic records. -IncludeDynamic changes them
+          anyway and makes them static.
+        - "Zone '<zone>' is not writable ..." or "... is read-only on ...":
+          the zone is secondary, stub or created by the server. Use a server
+          that hosts the primary zone.
+        - "This session already changed DNS on '<server>'; ...": a change
+          command ran on a second server in this session. Stay on one server
+          for a batch.
+        - "The DNS server '<server>' cannot be reached ...": the run stopped
+          and the remaining input was not processed. Fix the server or the
+          name and run the command again; what was done reports AlreadyDone.
         - Names with non-ASCII characters look wrong: the input file was saved
           without a BOM and Windows PowerShell 5.1 read it as ANSI. Save it as
           UTF-8 with BOM or read it with Get-Content -Encoding UTF8.
@@ -448,15 +613,20 @@ LONG DESCRIPTION
           then try again. If Group Policy sets the policy, ask the person who
           administers your computers.
 
-SEE ALSO
-    Get-DnsEntry, Get-DnsSnapshot, Update-DnsSnapshot
+    Stream merging. Do not merge the warning or information stream into the
+    output (*>&1, 3>&1) when a script captures the Result objects of a change
+    command; use -WarningVariable, -InformationVariable and -ErrorVariable.
 
-    Planned for later phases: Remove-DnsEntry, New-DnsEntry, Set-DnsEntry,
-    Get-DnsIssue, Repair-DnsIssue
+SEE ALSO
+    Get-DnsEntry, Get-DnsSnapshot, Update-DnsSnapshot, Remove-DnsEntry,
+    New-DnsEntry, Set-DnsEntry, New-DnsReverseZone, Backup-DnsZone
+
+    Planned for later phases: Get-DnsIssue, Repair-DnsIssue (phase 3),
+    Undo-DnsChange (phase 4)
 
     Each command has full help: Get-Help <command> -Full, and Get-Help
     <command> -Examples for examples only.
 
 KEYWORDS
     DNS, PTR, snapshot, Active Directory, zone, reverse lookup, WhatIf,
-    Constrained Language Mode
+    change log, Constrained Language Mode

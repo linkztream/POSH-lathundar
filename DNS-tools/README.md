@@ -1,7 +1,7 @@
 # DnsTools
 
-A PowerShell module for finding and checking DNS records in large Microsoft
-DNS (Active Directory-integrated) environments.
+A PowerShell module for finding, checking, creating, changing and removing DNS
+records in large Microsoft DNS (Active Directory-integrated) environments.
 
 ## 1. What DnsTools does
 
@@ -9,31 +9,69 @@ DnsTools finds A, AAAA and CNAME records and shows, for each one, whether its
 PTR (reverse lookup) record is correct. It was built for zones with hundreds of
 thousands of records, where DNS Manager and an unfiltered
 `Get-DnsServerResourceRecord` time out, by exporting each zone once into a local
-snapshot and searching that snapshot. Searching never changes a record.
+snapshot and searching that snapshot. Searching never changes a record. The same
+module can also remove, create and change records together with their PTR
+records, after checking each change live on the server (see
+[Everyday workflows](#5-everyday-workflows)).
 
-Status: this version has three commands, and none of them changes DNS.
+Status: this version has eight commands. Three of them only read. Five are
+*change commands* (they have `-WhatIf`, `-Force` and write the change log):
+`Remove-DnsEntry`, `New-DnsEntry`, `Set-DnsEntry` and `New-DnsReverseZone` change
+DNS, and `Backup-DnsZone` changes nothing in DNS but writes backup files on your
+computer.
 
-| Command | What it does |
-|---|---|
-| `Get-DnsEntry` | Finds A, AAAA and CNAME records by name, address or pattern and reports the PTR status of each. |
-| `Get-DnsSnapshot` | Lists the zones in the local snapshot with their export time and age. Contacts no server. |
-| `Update-DnsSnapshot` | Exports zones from a DNS server into the local snapshot. Writes local files only. |
+| Command | Kind | What it does |
+|---|---|---|
+| `Get-DnsEntry` | read | Finds A, AAAA and CNAME records by name, address or pattern and reports the PTR status of each. |
+| `Get-DnsSnapshot` | read | Lists the zones in the local snapshot with their export time and age. Contacts no server. |
+| `Update-DnsSnapshot` | read | Exports zones from a DNS server into the local snapshot. Writes local files only. |
+| `Remove-DnsEntry` | **change: DNS** | Removes A, AAAA and CNAME records together with their PTR records, DHCID records and CNAME aliases. |
+| `New-DnsEntry` | **change: DNS** | Creates static A, AAAA and CNAME records, with the PTR records of the addresses. |
+| `Set-DnsEntry` | **change: DNS** | Changes the TTL, the address, the PTR target or the alias target of existing records, in place. |
+| `New-DnsReverseZone` | **change: DNS** | Creates an Active Directory-integrated reverse lookup zone with the settings of an existing zone. |
+| `Backup-DnsZone` | **change: files only** | Saves zones as zone files in a new, time-stamped folder, with instructions for restoring them. |
 
-The commands that change records are planned (see
-[Everyday workflows](#5-everyday-workflows)). The rules below describe how they
-are planned to behave. None of them exists in this version.
+`Get-DnsIssue` (a consistency audit) and `Repair-DnsIssue` are planned for phase 3.
+They do not exist in this version.
 
-**What the planned change commands will never do without asking**
+**What the change commands never do without asking**
 
-- They will never change DNS on their own. A change happens only after you
-  previewed it with `-WhatIf`, answered the confirmation prompt, or passed
-  `-Force` (`-Force` means "no prompts at all", for unattended runs).
-- `Remove-DnsEntry` (planned for phase 2) will refuse to remove a name that an
-  NS or SRV record still points at, unless you pass the switch
-  `-AllowReferenced`.
-- They will never create a PTR record for a dynamic record (one with a
-  timestamp, registered by DHCP or by the client itself).
-- Every change will be written to the change log (see
+- **They never change DNS before a decision.** A change happens only after you
+  previewed it with `-WhatIf` (a rehearsal: nothing is changed), answered a
+  confirmation prompt with `Y` or `A`, or passed `-Force` or `-Confirm:$false`
+  (both mean "no prompts at all", for unattended runs).
+- **Which command asks by default.** The default `$ConfirmPreference` is `High`,
+  so only High-impact steps ask:
+  - `Remove-DnsEntry` asks once for every input item, for example
+    `srv01-old.contoso.local: remove 1 PTR, 1 A`. `Y` removes this item, `N`
+    skips it, `A` removes this item and every later item without asking again,
+    `S` stops the whole run.
+  - `New-DnsReverseZone` asks once, and `New-DnsEntry -CreateReverseZone` asks
+    once for each zone it would create.
+  - `Set-DnsEntry` asks once for every item when it changes an address. For a
+    TTL or a target it does not ask unless you add `-Confirm`.
+  - `New-DnsEntry` and `Backup-DnsZone` do not ask unless you add `-Confirm`.
+    `New-DnsEntry` checks every item first and writes nothing of it until every
+    check passed.
+- **`A` ("yes to all") is remembered per impact level.** An `A` at a record
+  prompt never approves the creation of a reverse zone later in the same run.
+- **A session that cannot prompt changes nothing.** A scheduled task or a
+  `-NonInteractive` session gets the error `This session cannot prompt. Re-run
+  with -Force to confirm all actions, or -WhatIf to preview.` instead of a hang.
+- **`-Force` only removes the questions.** Every safety check stays, and each
+  check has its own switch: `-AllowReferenced` (a name that NS, SRV or MX records
+  point at), `-IncludeDynamic` (a dynamic record), `-ReplacePtr` (a PTR record
+  that points at another name) and `-SkipReferenceCheck` (do not look for NS, SRV,
+  MX and CNAME records at all).
+- **They never touch dynamic records unasked.** A dynamic record is one with an
+  aging timestamp, registered by DHCP or by the client itself. `Set-DnsEntry`
+  skips it unless you pass `-IncludeDynamic`; `Remove-DnsEntry` removes it with a
+  warning, because the client may register it again. Every record that DnsTools
+  creates is static.
+- **They never take a pattern.** `*` and `?` are refused. Find the entries with
+  `Get-DnsEntry`, check the list, and pipe it to the change command.
+- **They always leave a trace.** Every step, also a rehearsal, a skipped step and
+  a failed step, is written to the change log (see
   [The change log](#7-the-change-log)).
 
 ## 2. Requirements
@@ -54,7 +92,9 @@ are planned to behave. None of them exists in this version.
 - **DNS permissions.** An account that may export zones on the server:
   membership of `DnsAdmins` or `Administrators`. Domain Admins is not required.
   Copying the zone export back from the server is a separate step (next point)
-  and may need more than `DnsAdmins`.
+  and may need more than `DnsAdmins`. The change commands need an account that
+  may change records in the zones they touch; a write that the server refuses
+  with "access denied" is a `Failed` result, never `AlreadyDone`.
 - **Network access to the DNS server.** Queries use the DnsServer cmdlets
   (CIM over WinRM, TCP 5985/5986). A zone export is a file that the server
   writes into `%windir%\System32\dns`, so `Update-DnsSnapshot` must also copy
@@ -65,6 +105,12 @@ are planned to behave. None of them exists in this version.
   WinRM (`Invoke-Command`, needs permission to open a remote PowerShell
   session). If all of them are blocked for your account, snapshots fail (see
   [Troubleshooting](#8-troubleshooting)).
+- **WMI access for two checks.** `Remove-DnsEntry` asks the server which NS, SRV, MX
+  and CNAME records point at a name, and `Set-DnsEntry -TTL` changes TTLs, through
+  WMI (the CIM namespace `root\MicrosoftDNS` on the server). `Remove-DnsEntry` can
+  use a fresh snapshot instead of the first; without either it skips the item and
+  says why. Without WMI, `Set-DnsEntry -TTL` falls back to the DnsServer cmdlet
+  (see [Known limitations](#9-known-limitations)).
 
 ## 3. Installation, step by step
 
@@ -256,8 +302,9 @@ delegated PTR shows as `Missing`. Run `Update-DnsSnapshot` first when this
 matters. `Get-Help about_DnsTools` gives the usual cause of each value and what
 to do about it.
 
-Before using change commands in production (when they exist), rehearse in a test
-zone on a test server, run everything with `-WhatIf` first and read the change log.
+Before you use the change commands in production, rehearse in a test zone on a test
+server, run everything with `-WhatIf` first and read the change log (see
+[Everyday workflows](#5-everyday-workflows) and [The change log](#7-the-change-log)).
 
 ## 5. Everyday workflows
 
@@ -414,29 +461,658 @@ the way you protect the zones. The search index is built from these files and
 kept in memory for the PowerShell session, so the first snapshot search of a new
 session reads the files again, with a progress bar on large zones.
 
-### Commands planned for a later phase
+### Before you change anything: the habits and the result rows
 
-#### Remove-DnsEntry
-Planned for a later phase.
+`Remove-DnsEntry`, `New-DnsEntry`, `Set-DnsEntry`, `New-DnsReverseZone` and
+`Backup-DnsZone` work the same way. The examples below use `dc01`, the zone
+`contoso.local` and its reverse zone `16.0.10.in-addr.arpa`; replace them with
+your own. Every example in this section was run against stand-ins for the DnsServer
+cmdlets, and its output is pasted here as it appeared. (Names and addresses are
+made up, and GUIDs in the output are shortened to their first eight characters.)
 
-#### New-DnsEntry
-Planned for a later phase.
+**Habit 1: rehearse with `-WhatIf`.** Add `-WhatIf` to any change command first.
+It prints one "What if" line for every item, returns the result rows that the real
+run would return, with `WhatIf` in the `Result` column for every step that would
+change something, and changes nothing. The rehearsal is written to the change log
+too. Then run the same command without `-WhatIf`.
 
-#### Set-DnsEntry
-Planned for a later phase.
+**Habit 2: find, look, then pipe.** The change commands take exact names and
+addresses, never patterns. Find the entries with `Get-DnsEntry`, look at the list,
+and pipe it to the change command. An entry from `Get-DnsEntry` names exactly one
+record: if `db01` has two A records and you pipe only one of them, only that record
+is changed.
 
-#### Get-DnsIssue
-Planned for a later phase.
+**Habit 3: read the result rows, not the console text.** Every step of a change
+is one row, and one command can make several steps: removing a host is one row for
+its PTR record and one for its A record. The default table shows five columns:
 
-#### Repair-DnsIssue
-Planned for a later phase.
+| Column | Meaning |
+|---|---|
+| `Action` | The step: `RemovePtr`, `RemoveA`, `RemoveAAAA`, `RemoveCName`, `RemoveDhcid`, `AddA`, `AddAAAA`, `AddPtr`, `AddCName`, `SetTtl`, `SetAddress`, `SetTarget`, `SetPtrTarget`, `CreateZone`, `SetZoneAging` or `Backup`. |
+| `Name` | The owner of the record. For a PTR record it is the reverse name, such as `9.16.0.10.in-addr.arpa`. For a zone it is the zone name. |
+| `Data` | The address, or the name the record points at (a PTR or CNAME target). For `CreateZone` it is the network, for `Backup` the file. |
+| `Result` | What happened: see the next table. |
+| `Error` | Why a step was skipped or failed. Empty otherwise. The table cuts it at the width of the window; `Format-List` shows it whole. |
+
+| `Result` | Meaning |
+|---|---|
+| `Success` | The step was done. |
+| `WhatIf` | You used `-WhatIf`. Nothing was done; this is what would be done. |
+| `AlreadyDone` | The wanted state already held: the record is already gone, already there with the same data, already set, or the zone already exists. It counts as a success, so running a command twice is safe. |
+| `Skipped` | The step was left out on purpose and `Error` says why (a referenced name, a dynamic record, a read-only zone, you answered `N`). Nothing is wrong, but somebody should look. |
+| `Failed` | The checks or the server refused. `Error` says why, and the command also writes an error. The other items go on. |
+
+Every row is a `DnsTools.Result` object with twelve properties. `Format-List` shows
+all of them:
+
+```powershell
+Remove-DnsEntry srv01-old.contoso.local -Server dc01 -Confirm:$false | Select-Object -First 1 | Format-List
+```
+
+```
+Action    : RemovePtr
+Name      : 9.16.0.10.in-addr.arpa
+Type      : PTR
+Data      : srv01-old.contoso.local
+Result    : Success
+Error     :
+Zone      : 16.0.10.in-addr.arpa
+NodeName  : 9
+Server    : dc01
+Id        : 620aae59
+BatchId   : 880dca60
+Timestamp : 2026-10-13 20:25:16
+```
+
+`Id` is also the `Id` of the line in the change log, and `BatchId` is the same for
+every row of one command run. `Pending` is part of the object but none of the five
+commands writes it.
+
+**One server, and the snapshot.** A change command changes one server (`-Server`;
+without it, your logon server), and Active Directory replication carries the change
+to the other domain controllers. The local snapshot is not updated by a change; run
+`Update-DnsSnapshot` before you search it again.
+
+### Remove records: `Remove-DnsEntry`
+
+Takes a host out of DNS the way you would by hand, but checked and logged. For
+every name you give it, it removes in this order:
+
+1. the **PTR records** that point at the name,
+2. the **A and AAAA records** of the name,
+3. the **DHCID record** of the name, when the name has no A or AAAA record left,
+4. the **CNAME aliases** that point at the name, when the name has no record left
+   (not with `-KeepAlias`).
+
+You can give it an FQDN (`srv01-old.contoso.local`), a bare name with `-Zone`, an
+IP address (every A or AAAA record with that address, and the PTR records of the
+address), an entry from `Get-DnsEntry` (exactly that record), or a file
+(`-InputFile`: one name or address per line, `#` for comments, or a CSV file with a
+`Name` column).
+
+It asks once for every input item. The question names what will be removed:
+
+```powershell
+Remove-DnsEntry srv01-old.contoso.local -Server dc01
+```
+
+```
+Remove DNS records
+  srv01-old.contoso.local: remove 1 PTR, 1 A
+[Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N): y
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+RemovePtr     9.16.0.10.in-addr.arpa          srv01-old.contoso.local        Success
+RemoveA       srv01-old.contoso.local         10.0.16.9                      Success
+```
+
+Run the same command again: the name is gone, nothing is asked, and the answer is
+`AlreadyDone`.
+
+**Pipeline from `Get-DnsEntry`.** Find, look, rehearse:
+
+```powershell
+Get-DnsEntry '*-old.contoso.local' -Server dc01 | Remove-DnsEntry -Server dc01 -WhatIf
+```
+
+```
+What if: Performing the operation "Remove DNS records" on target "app01-old.contoso.local: remove 1 PTR, 1 A".
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+RemovePtr     31.16.0.10.in-addr.arpa         app01-old.contoso.local        WhatIf
+RemoveA       app01-old.contoso.local         10.0.16.31                     WhatIf
+What if: Performing the operation "Remove DNS records" on target "app02-old.contoso.local: remove 1 PTR, 1 A".
+RemovePtr     32.16.0.10.in-addr.arpa         app02-old.contoso.local        WhatIf
+RemoveA       app02-old.contoso.local         10.0.16.32                     WhatIf
+What if: Performing the operation "Remove DNS records" on target "srv01-old.contoso.local: remove 1 PTR, 1 A".
+RemovePtr     9.16.0.10.in-addr.arpa          srv01-old.contoso.local        WhatIf
+RemoveA       srv01-old.contoso.local         10.0.16.9                      WhatIf
+```
+
+(A pattern search like this one reads the snapshot.) Then run it for real. Here the
+first question is answered `n` and the second `a`, so the third name is removed
+without a question. A declined item is not an error: both steps of `app01-old` are
+`Skipped`.
+
+```powershell
+Get-DnsEntry '*-old.contoso.local' -Server dc01 | Remove-DnsEntry -Server dc01
+```
+
+```
+Remove DNS records
+  app01-old.contoso.local: remove 1 PTR, 1 A
+[Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N): n
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+RemovePtr     31.16.0.10.in-addr.arpa         app01-old.contoso.local        Skipped     Declined at the confirmatio...
+RemoveA       app01-old.contoso.local         10.0.16.31                     Skipped     Declined at the confirmatio...
+Remove DNS records
+  app02-old.contoso.local: remove 1 PTR, 1 A
+[Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N): a
+RemovePtr     32.16.0.10.in-addr.arpa         app02-old.contoso.local        Success
+RemoveA       app02-old.contoso.local         10.0.16.32                     Success
+RemovePtr     9.16.0.10.in-addr.arpa          srv01-old.contoso.local        Success
+RemoveA       srv01-old.contoso.local         10.0.16.9                      Success
+```
+
+**What `Remove-DnsEntry` refuses.** It will not remove a name that an NS, SRV or MX
+record still points at. The whole item is `Skipped`, one row per record that would
+have been removed, and `Error` tells which records point at it:
+
+```powershell
+Remove-DnsEntry dc01.contoso.local -Server dc01 | Format-List Action, Name, Result, Error
+```
+
+```
+Action : RemovePtr
+Name   : 10.16.0.10.in-addr.arpa
+Result : Skipped
+Error  : Referenced by 1 SRV and 1 NS records (_ldap._tcp.contoso.local, contoso.local). Add -AllowReferenced to remove
+          it anyway.
+
+Action : RemoveA
+Name   : dc01.contoso.local
+Result : Skipped
+Error  : Referenced by 1 SRV and 1 NS records (_ldap._tcp.contoso.local, contoso.local). Add -AllowReferenced to remove
+          it anyway.
+```
+
+Add `-AllowReferenced` to remove the name anyway (a warning repeats the list, and
+those NS, SRV and MX records are left pointing at a name that no longer exists).
+Other safety rules, which `-Force` does not switch off:
+
+- Records in a read-only zone (secondary, stub and server-created zones) are
+  `Skipped`.
+- When a PTR record in a writable zone cannot be removed, the A and AAAA records
+  of that name are kept (`Skipped`), so that no orphaned PTR record is left behind.
+- A dynamic record is removed with a warning that the client or the DHCP server may
+  register it again.
+- When neither a fresh snapshot nor WMI access can tell what points at a name, the
+  item is `Skipped` and `Error` says so.
+
+A name with CNAME aliases takes its aliases with it, and each alias is checked for
+references of its own:
+
+```powershell
+Remove-DnsEntry web.contoso.local -Server dc01 -Confirm:$false
+```
+
+```
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+RemovePtr     40.16.0.10.in-addr.arpa         web.contoso.local              Success
+RemoveA       web.contoso.local               10.0.16.40                     Success
+RemoveCName   www.contoso.local               web.contoso.local              Success
+RemoveCName   shop.contoso.local              web.contoso.local              Success
+```
+
+**By address.** `Remove-DnsEntry 10.0.16.88 -Server dc01` finds the A and AAAA
+records that have the address and removes them with their PTR records. A PTR record
+of the address that points at a name without an A or AAAA record (the host is gone
+and its PTR record stayed behind) is an orphan, and is removed too. A records are
+found through the PTR records of the address and, when a snapshot of the server
+exists, through the snapshot; without one a warning says so.
+
+```powershell
+Remove-DnsEntry 10.0.16.88 -Server dc01
+```
+
+```
+WARNING: A records without a PTR cannot be found by address without a snapshot. No snapshot of 'dc01' exists, so only
+the names that PTR records point at are removed; run Update-DnsSnapshot -Server dc01 first to find the others too.
+Remove DNS records
+  10.0.16.88: remove 1 PTR
+[Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N): y
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+RemovePtr     88.16.0.10.in-addr.arpa         gone01.contoso.local           Success
+```
+
+**`-KeepPtr`.** Leaves the PTR records alone. On Windows Server 2025 that cannot be
+done: when an A record is removed, by any tool, the server deletes the PTR record
+that points at its name (verified on 2026-10-13; older servers keep it). So after
+every removal `Remove-DnsEntry -KeepPtr` reads the PTR records again. On Windows
+Server 2025 you get a `RemovePtr` row with the explanation and one warning; on an
+older server the PTR record stays and there is no row for it.
+
+```powershell
+Remove-DnsEntry app01-old.contoso.local -Server dc01 -KeepPtr -Confirm:$false
+```
+
+```
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+RemoveA       app01-old.contoso.local         10.0.16.31                     Success
+RemovePtr     31.16.0.10.in-addr.arpa         app01-old.contoso.local        Success     Removed by the DNS server t...
+WARNING: Removed by the DNS server together with the A record; -KeepPtr cannot be honoured on this server.
+```
+
+The other switches: `-KeepAlias` leaves the aliases; `-SkipReferenceCheck` does
+not look for NS, SRV, MX and CNAME records at all (and so leaves aliases behind;
+use it only when neither a fresh snapshot nor WMI access is available and you know
+the names are unreferenced); `-MaxSnapshotAge` is the oldest snapshot the reference
+check trusts; `-Delay 2` waits two seconds after each input item.
+
+### Create records: `New-DnsEntry`
+
+Creates **static** records (they have no aging timestamp, so scavenging never
+removes them): a host (`-Name` and `-Address`: one A or AAAA record per address
+and the PTR record of each address), an alias (`-Name` and `-Target`: one CNAME
+record), or many of them from a CSV file (`-InputFile`) or from the pipeline. A PTR
+record gets the same TTL as its A record. Without `-TTL` the zone's default
+applies.
+
+Before anything of an item is written, `New-DnsEntry` checks it live: the name must
+not be an alias, an alias needs a name without other records, the name must not
+lie below a delegation, and (unless you pass `-NoPtr`) a reverse zone must cover
+each address. If one check fails, nothing of that item is created. It does not
+ask unless you add `-Confirm`.
+
+```powershell
+New-DnsEntry -Name srv10.contoso.local -Address 10.0.16.110 -Server dc01
+```
+
+```
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+AddA          srv10.contoso.local             10.0.16.110                    Success
+AddPtr        110.16.0.10.in-addr.arpa        srv10.contoso.local            Success
+```
+
+Run it again and both rows say `AlreadyDone`. An alias is created the same way:
+`New-DnsEntry -Name ftp -Zone contoso.local -Target srv01.contoso.local -TTL 300 -Server dc01`.
+
+**No reverse zone.** If no reverse zone on the server covers the address, the
+host is **not** created, so that no host is left without its PTR record:
+
+```powershell
+New-DnsEntry -Name srv11.contoso.local -Address 10.0.99.7 -Server dc01
+```
+
+```
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+AddA          srv11.contoso.local             10.0.99.7                      Failed      No reverse lookup zone on '...
+New-DnsEntry: No reverse lookup zone on 'dc01' covers 10.0.99.7, so its PTR record cannot be created, and
+'srv11.contoso.local' is not created either. Add -NoPtr to create the record without a PTR record, or
+-CreateReverseZone to create the zone 99.0.10.in-addr.arpa (10.0.99.0/24) first.
+```
+
+The message names both ways out: `-NoPtr` creates the host without a PTR record,
+and `-CreateReverseZone` creates the /24 zone first (an IPv6 address gets a /64
+zone) with the settings of the forward zone, as part of the same run. Creating a
+zone has High impact, so this asks even though `New-DnsEntry` does not ask for the
+records; here the question is answered `y`:
+
+```powershell
+New-DnsEntry -Name srv11.contoso.local -Address 10.0.99.7 -CreateReverseZone -Server dc01
+```
+
+```
+Create reverse zone
+  99.0.10.in-addr.arpa (10.0.99.0/24) on dc01, settings from contoso.local: replication scope Custom
+(DomainDnsZones.contoso.local), dynamic update Secure
+[Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N): y
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+CreateZone    99.0.10.in-addr.arpa            10.0.99.0/24                   Success
+SetZoneAging  99.0.10.in-addr.arpa            Aging=True, NoRefreshInterv... Success
+WARNING: Zone '99.0.10.in-addr.arpa' was created on 'dc01'. Other domain controllers see it only after Active Directory
+replication plus their DsPollingInterval (180 seconds by default); until then, create its records on 'dc01'.
+AddA          srv11.contoso.local             10.0.99.7                      Success
+AddPtr        7.99.0.10.in-addr.arpa          srv11.contoso.local            Success
+```
+
+**Pipeline from `Get-DnsEntry`.** `New-DnsEntry` binds `Name`, `Address`, `Target`,
+`TTL` and `Zone` from the pipeline by property name. An entry has `Data`, not
+`Address`, so name it with `Select-Object`. This gives the address of `srv01-old` a
+second name, `srv02`:
+
+```powershell
+Get-DnsEntry srv01-old.contoso.local -Server dc01 |
+    Select-Object @{ Name = 'Name'; Expression = { 'srv02.contoso.local' } }, @{ Name = 'Address'; Expression = { $_.Data } }, TTL |
+    New-DnsEntry -Server dc01 -WhatIf
+```
+
+```
+What if: Performing the operation "Add DNS records" on target "srv02.contoso.local: add 1 A".
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+AddA          srv02.contoso.local             10.0.16.9                      WhatIf
+AddPtr        9.16.0.10.in-addr.arpa          srv02.contoso.local            Skipped     10.0.16.9 already has a PTR...
+```
+
+The A record can be created, but the address already has a PTR record that points
+at the old name. That record is left alone (`Skipped`) unless you add
+`-ReplacePtr`, which removes it and adds the PTR record of the new name:
+
+```powershell
+Get-DnsEntry srv01-old.contoso.local -Server dc01 |
+    Select-Object @{ Name = 'Name'; Expression = { 'srv02.contoso.local' } }, @{ Name = 'Address'; Expression = { $_.Data } }, TTL |
+    New-DnsEntry -Server dc01 -ReplacePtr -WhatIf
+```
+
+```
+What if: Performing the operation "Add DNS records" on target "srv02.contoso.local: add 1 A, 1 PTR; remove 1 PTR
+pointing elsewhere".
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+AddA          srv02.contoso.local             10.0.16.9                      WhatIf
+RemovePtr     9.16.0.10.in-addr.arpa          srv01-old.contoso.local        WhatIf
+AddPtr        9.16.0.10.in-addr.arpa          srv02.contoso.local            WhatIf
+```
+
+**From a CSV file.** The columns are `Name` and `Address` (a host) or `Name` and
+`Target` (an alias), and optionally `TTL` (seconds) and `Zone`. Comma or semicolon
+both work (Excel in a European locale writes semicolons), and the file is read as
+UTF-8. With the file
+
+```
+Name,Address,Target,TTL
+srv20.contoso.local,10.0.16.120,,
+srv21.contoso.local,10.0.16.121,,600
+files.contoso.local,,srv20.contoso.local,
+```
+
+```powershell
+New-DnsEntry -InputFile .\new-hosts.csv -Server dc01 -WhatIf
+```
+
+```
+What if: Performing the operation "Add DNS records" on target "srv20.contoso.local: add 1 A, 1 PTR".
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+AddA          srv20.contoso.local             10.0.16.120                    WhatIf
+AddPtr        120.16.0.10.in-addr.arpa        srv20.contoso.local            WhatIf
+What if: Performing the operation "Add DNS records" on target "srv21.contoso.local: add 1 A, 1 PTR".
+AddA          srv21.contoso.local             10.0.16.121                    WhatIf
+AddPtr        121.16.0.10.in-addr.arpa        srv21.contoso.local            WhatIf
+What if: Performing the operation "Add DNS records" on target "files.contoso.local: add 1 CNAME".
+AddCName      files.contoso.local             srv20.contoso.local            WhatIf
+```
+
+### Change records: `Set-DnsEntry`
+
+Changes existing records **in place**; it does not delete and re-create them. At
+least one of:
+
+- `-TTL`: the TTL of every A, AAAA and CNAME record of the name and of every PTR
+  record that points at it (only the exact record when you pipe an entry).
+- `-Address`: moves one A or AAAA record to a new address. The PTR follows: the old
+  PTR record is removed, the address is changed, and a PTR record for the new
+  address is added. Exactly one record must be named, so a name with two A records
+  needs a piped entry.
+- `-PtrTarget`: the target of the PTR record of an IP address. If the address has
+  no PTR record, one is added.
+- `-Target`: the target of an alias (CNAME). The server accepts an alias that
+  points at itself and `Set-DnsEntry` does not detect it, so check the name.
+
+`-Address`, `-PtrTarget` and `-Target` exclude each other; `-TTL` combines with any
+of them. A value that is already as requested gives `AlreadyDone` and is not
+written. `Set-DnsEntry` asks once for every item with `-Address` (High impact) and
+does not ask for the others unless you add `-Confirm`.
+
+```powershell
+Set-DnsEntry srv01.contoso.local -TTL 300 -Server dc01
+```
+
+```
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+SetTtl        srv01.contoso.local             10.0.16.5                      Success
+SetTtl        5.16.0.10.in-addr.arpa          srv01.contoso.local            Success
+```
+
+(The TTL of the PTR record is changed too. Run it again and both rows are
+`AlreadyDone`.)
+
+**Pipeline from `Get-DnsEntry`.** `db01` has two A records. The piped entry names the
+one to move. Without `-WhatIf` the command asks once, and the question lists the
+three steps:
+
+```powershell
+Get-DnsEntry db01.contoso.local -Server dc01 | Where-Object Data -eq '10.0.16.21' | Set-DnsEntry -Address 10.0.16.25 -Server dc01 -WhatIf
+```
+
+```
+What if: Performing the operation "Change DNS records" on target "db01.contoso.local: remove PTR
+21.16.0.10.in-addr.arpa -> db01.contoso.local; change A db01.contoso.local from 10.0.16.21 to 10.0.16.25; add PTR
+25.16.0.10.in-addr.arpa -> db01.contoso.local".
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+RemovePtr     21.16.0.10.in-addr.arpa         db01.contoso.local             WhatIf
+SetAddress    db01.contoso.local              10.0.16.25                     WhatIf
+AddPtr        25.16.0.10.in-addr.arpa         db01.contoso.local             WhatIf
+```
+
+**Dynamic records.** A record with an aging timestamp belongs to the client or the
+DHCP server, so `Set-DnsEntry` skips it. With `-IncludeDynamic` it is changed, with a
+warning for each record:
+
+```powershell
+Set-DnsEntry laptop07.contoso.local -TTL 600 -IncludeDynamic -Server dc01 -Confirm:$false
+```
+
+```
+WARNING: Changing the dynamic A record 'laptop07.contoso.local' (10.0.16.200) because of -IncludeDynamic; the client or
+the DHCP server may register the old value again.
+WARNING: Changing the dynamic PTR record '200.16.0.10.in-addr.arpa' (laptop07.contoso.local) because of
+-IncludeDynamic; the client or the DHCP server may register the old value again.
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+SetTtl        laptop07.contoso.local          10.0.16.200                    Success
+SetTtl        200.16.0.10.in-addr.arpa        laptop07.contoso.local         Success
+```
+
+**Every change makes a record static.** The server clears the aging timestamp of a
+record that is changed, also with `-IncludeDynamic` (verified on Windows Server
+2025 on 2026-10-13). The client or the DHCP server may register the old value
+again. `Before.Timestamp` in the change log keeps the old timestamp.
+
+```powershell
+Get-DnsEntry laptop07.contoso.local -Server dc01 | Select-Object Name, Type, Data, Timestamp, IsStatic
+$null = Set-DnsEntry laptop07.contoso.local -TTL 600 -IncludeDynamic -Server dc01 -Confirm:$false 3>$null
+Get-DnsEntry laptop07.contoso.local -Server dc01 | Select-Object Name, Type, Data, Timestamp, IsStatic
+```
+
+```
+Name      : laptop07.contoso.local
+Type      : A
+Data      : 10.0.16.200
+Timestamp : 2026-10-10 02:00:00
+IsStatic  : False
+
+Name      : laptop07.contoso.local
+Type      : A
+Data      : 10.0.16.200
+Timestamp :
+IsStatic  : True
+```
+
+### Create a reverse zone: `New-DnsReverseZone`
+
+Creates the reverse lookup zone for one network, so that PTR records can be
+created. The name follows from `-NetworkId`: an IPv4 /8, /16 or /24 network, or an
+IPv6 network whose prefix is a multiple of 4. The new zone is stored in Active
+Directory, in the same partition as the zone named in `-CopySettingsFrom`, with that
+zone's dynamic update and aging settings. It asks once (High impact).
+
+```powershell
+New-DnsReverseZone -NetworkId 10.0.99.0/24 -CopySettingsFrom contoso.local -Server dc01 -WhatIf
+```
+
+```
+What if: Performing the operation "Create reverse zone" on target "99.0.10.in-addr.arpa (10.0.99.0/24) on dc01,
+settings from contoso.local: replication scope Custom (DomainDnsZones.contoso.local), dynamic update Secure".
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+CreateZone    99.0.10.in-addr.arpa            10.0.99.0/24                   WhatIf
+SetZoneAging  99.0.10.in-addr.arpa            Aging=True, NoRefreshInterv... WhatIf
+```
+
+Without `-WhatIf` the command asks and creates the zone. A zone that already exists
+is left exactly as it is and reported as `AlreadyDone`. The warning after a
+creation is true: other domain controllers see the zone only after Active
+Directory replication, so create its PTR records on the same `-Server` until then.
+
+```powershell
+New-DnsReverseZone -NetworkId 10.0.99.0/24 -CopySettingsFrom contoso.local -Server dc01
+```
+
+```
+Create reverse zone
+  99.0.10.in-addr.arpa (10.0.99.0/24) on dc01, settings from contoso.local: replication scope Custom
+(DomainDnsZones.contoso.local), dynamic update Secure
+[Y] Yes  [N] No  [A] Yes to all  [S] Stop (default is N): y
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+CreateZone    99.0.10.in-addr.arpa            10.0.99.0/24                   Success
+SetZoneAging  99.0.10.in-addr.arpa            Aging=True, NoRefreshInterv... Success
+WARNING: Zone '99.0.10.in-addr.arpa' was created on 'dc01'. Other domain controllers see it only after Active Directory
+replication plus their DsPollingInterval (180 seconds by default); until then, create its records on 'dc01'.
+```
+
+**Pipeline from `Get-DnsEntry`.** The entries that report `NoReverseZone` tell which
+networks lack a zone. This rehearsal derives the /24 networks from their addresses:
+
+```powershell
+Get-DnsEntry '*' -Server dc01 | Where-Object PtrStatus -eq 'NoReverseZone' |
+    ForEach-Object { $_.Data -replace '\.\d+$', '.0/24' } | Select-Object -Unique |
+    ForEach-Object { New-DnsReverseZone -NetworkId $_ -CopySettingsFrom contoso.local -Server dc01 -WhatIf }
+```
+
+```
+What if: Performing the operation "Create reverse zone" on target "17.0.10.in-addr.arpa (10.0.17.0/24) on dc01,
+settings from contoso.local: replication scope Custom (DomainDnsZones.contoso.local), dynamic update Secure".
+
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+CreateZone    17.0.10.in-addr.arpa            10.0.17.0/24                   WhatIf
+SetZoneAging  17.0.10.in-addr.arpa            Aging=True, NoRefreshInterv... WhatIf
+```
+
+It does not create classless (RFC 2317) zones or zones for prefixes such as /23 or
+/25.
+
+### Back up zones: `Backup-DnsZone`
+
+Saves zones from a server as zone files in a new folder on your computer, before a
+risky clean-up. It changes nothing in DNS. It asks once for the whole run, but only
+with `-Confirm` (its impact is Low). Without `-Zone` it saves every exportable zone
+(primary zones the server did not create itself).
+
+```powershell
+Backup-DnsZone -Server dc01 -Path .\backup
+```
+
+```
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+Backup        contoso.local                   C:\Users\you\AppData\Local\... Success
+Backup        16.0.10.in-addr.arpa            C:\Users\you\AppData\Local\... Success
+```
+
+`Data` is the file; the table cuts it at the window width. The folder is
+`<server>-<yyyyMMdd-HHmmss>` below `-Path` (default `%LOCALAPPDATA%\DnsTools\backup`)
+and is never reused:
+
+```powershell
+Get-ChildItem .\backup -Recurse -File | Select-Object @{ Name = 'File'; Expression = { $_.FullName.Substring($_.FullName.IndexOf('\backup\') + 8) } }, Length
+```
+
+```
+File                                                                 Length
+----                                                                 ------
+dc01-20261013-202518\backup_16.0.10.in-addr.arpa_20261013-202518.txt    786
+dc01-20261013-202518\backup_contoso.local_20261013-202518.txt           850
+dc01-20261013-202518\RESTORE.md                                        2918
+```
+
+`RESTORE.md` in the folder lists the files and says how to put back a single record
+with `New-DnsEntry`, or a whole Active Directory-integrated zone with `dnscmd`. The
+SOA serial number and the aging timestamps are not restored, and zone settings
+(dynamic update, aging, replication scope, security) are not in a zone file. The
+files are plain text and list every name and address of the zone: protect the
+folder like the zone.
+
+**With `Get-DnsEntry`: back up first, then remove.** The zones of the entries are
+saved, then the removal is rehearsed (run it without `-WhatIf` once you have read
+the rows):
+
+```powershell
+$entries = Get-DnsEntry '*-old.contoso.local' -Server dc01
+Backup-DnsZone -Zone ($entries.Zone | Select-Object -Unique) -Server dc01 -Path .\backup
+$entries | Remove-DnsEntry -Server dc01 -WhatIf
+```
+
+```
+Action        Name                            Data                           Result      Error
+------        ----                            ----                           ------      -----
+Backup        contoso.local                   C:\Users\you\AppData\Local\... Success
+What if: Performing the operation "Remove DNS records" on target "app01-old.contoso.local: remove 1 PTR, 1 A".
+RemovePtr     31.16.0.10.in-addr.arpa         app01-old.contoso.local        WhatIf
+RemoveA       app01-old.contoso.local         10.0.16.31                     WhatIf
+What if: Performing the operation "Remove DNS records" on target "app02-old.contoso.local: remove 1 PTR, 1 A".
+RemovePtr     32.16.0.10.in-addr.arpa         app02-old.contoso.local        WhatIf
+RemoveA       app02-old.contoso.local         10.0.16.32                     WhatIf
+What if: Performing the operation "Remove DNS records" on target "srv01-old.contoso.local: remove 1 PTR, 1 A".
+RemovePtr     9.16.0.10.in-addr.arpa          srv01-old.contoso.local        WhatIf
+RemoveA       srv01-old.contoso.local         10.0.16.9                      WhatIf
+```
+
+`Backup-DnsZone -WhatIf` creates no folder and shows the files that would be
+written. A zone that is not hosted on the server, or is not exportable, gives a
+`Failed` row and an error for that zone; the other zones go on.
+
+### Planned for phase 3: `Get-DnsIssue` and `Repair-DnsIssue`
+
+`Get-DnsIssue` (a consistency audit) and `Repair-DnsIssue` do not exist in this
+version. Phase 4 plans `Undo-DnsChange`, which will read the change log.
 
 ## 6. Automation
 
-A script for Task Scheduler that uses only the commands that exist today. It
-refreshes the snapshot of one DNS server, then writes every A or AAAA record whose
-PTR record is not in order to a dated CSV file. Save it, for example, as
-`C:\Scripts\Get-PtrReport.ps1`.
+DnsTools is written to be called from scheduled scripts. Two templates follow: a
+nightly report that changes nothing, and a removal from an input file. In both, the
+script passes `-Server`, never waits for a prompt, and decides from objects and exit
+codes, not from console text.
+
+### A nightly report that changes nothing
+
+A script for Task Scheduler that only reads. It refreshes the snapshot of one DNS
+server, then writes every A or AAAA record whose PTR record is not in order to a
+dated CSV file. Save it, for example, as `C:\Scripts\Get-PtrReport.ps1`.
 
 ```powershell
 <#
@@ -508,7 +1184,161 @@ Notes on the template:
 - **Warnings** (a stale snapshot, a skipped zone) do not stop the script; the
   template saves them next to the CSV file.
 
-### What the commands guarantee today
+### A removal from an input file
+
+A script that removes the names listed in a text file, writes the change log to a
+fixed file and sets the exit code from the result rows. Save it, for example, as
+`C:\Scripts\Remove-DecommissionedHosts.ps1`. The text file is the kind described in
+[Remove records](#remove-records-remove-dnsentry): one name or address per line,
+`#` for comments.
+
+```powershell
+<#
+.SYNOPSIS
+    Removes the DNS entries listed in a text file and sets the exit code from the Results.
+
+.DESCRIPTION
+    Exit code 0: every entry was removed or was already gone.
+    Exit code 1: the run stopped at a failure, or could not start.
+    Exit code 2: the run finished, but some entries were skipped and need a person.
+#>
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory)] [string]$Server,
+    [Parameter(Mandatory)] [string]$InputFile,
+    [Parameter(Mandatory)] [string]$LogPath
+)
+
+Import-Module DnsTools -ErrorAction Stop
+
+# -Force: never prompt. -ErrorAction Stop: the first entry that fails ends the run,
+# after its Failed Result and its log line were written. -OutVariable keeps the
+# Results that were produced up to that point. A precondition (input file missing,
+# server unreachable) throws whatever -ErrorAction says, and is caught here too.
+$stopped = $null
+try {
+    Remove-DnsEntry -InputFile $InputFile -Server $Server -Force -LogPath $LogPath -ErrorAction Stop -OutVariable results | Out-Null
+}
+catch {
+    $stopped = $_.Exception.Message
+}
+
+$removed = @($results | Where-Object Result -eq 'Success').Count
+$gone    = @($results | Where-Object Result -eq 'AlreadyDone').Count
+$skipped = @($results | Where-Object Result -eq 'Skipped')
+$failed  = @($results | Where-Object Result -eq 'Failed')
+
+'{0} removed, {1} already gone, {2} skipped, {3} failed. Change log: {4}' -f $removed, $gone, $skipped.Count, $failed.Count, $LogPath
+foreach ($result in $skipped) {
+    'Skipped {0} {1}: {2}' -f $result.Name, $result.Data, $result.Error
+}
+if ($stopped) {
+    "The run stopped: $stopped"
+}
+
+if ($stopped -or $failed.Count -gt 0) { exit 1 }
+if ($skipped.Count -gt 0) { exit 2 }
+exit 0
+```
+
+Run it from Task Scheduler with, for example:
+
+```
+powershell.exe -NoProfile -NonInteractive -File C:\Scripts\Remove-DecommissionedHosts.ps1 -Server dc01 -InputFile D:\Dns\decommissioned.txt -LogPath D:\Dns\Logs\changes.jsonl
+```
+
+Rehearse it first at a prompt: `Remove-DnsEntry -InputFile D:\Dns\decommissioned.txt
+-Server dc01 -WhatIf` shows every row the script would produce. Below, the script is
+run in five situations (the command is the same each time; the last line prints the
+exit code). The texts after a colon, such as "Stub failure", come from the stand-ins
+for the DnsServer cmdlets that were used here; a real server words them its own way.
+
+```powershell
+.\Remove-DecommissionedHosts.ps1 -Server dc01 -InputFile .\decommissioned.txt -LogPath .\changes.jsonl
+"exit code: $LASTEXITCODE"
+```
+
+**Everything removed.** Exit code 0:
+
+```
+6 removed, 0 already gone, 0 skipped, 0 failed. Change log: .\changes.jsonl
+exit code: 0
+```
+
+**A name is referenced** (the file lists `app01-old` and `dc01`). The run finishes,
+the two records of `dc01` are `Skipped`, and exit code 2 tells a person to look:
+
+```
+2 removed, 0 already gone, 2 skipped, 0 failed. Change log: .\changes.jsonl
+Skipped 10.16.0.10.in-addr.arpa dc01.contoso.local: Referenced by 1 SRV and 1 NS records (_ldap._tcp.contoso.local,
+contoso.local). Add -AllowReferenced to remove it anyway.
+Skipped dc01.contoso.local 10.0.16.10: Referenced by 1 SRV and 1 NS records (_ldap._tcp.contoso.local, contoso.local).
+Add -AllowReferenced to remove it anyway.
+exit code: 2
+```
+
+**The server refuses a write** (access denied). `-ErrorAction Stop` ends the run at
+the first failed item, after its `Failed` row and its log line were written. The PTR
+record of `srv01-old` was removed before its A record, and the A record is still
+there. Exit code 1:
+
+```
+1 removed, 0 already gone, 0 skipped, 1 failed. Change log: .\changes.jsonl
+The run stopped: Could not remove the A record '10.0.16.9' of 'srv01-old' in zone 'contoso.local': Stub failure: failed
+to remove the resource record srv01-old in zone contoso.local on server dc01.
+exit code: 1
+```
+
+**The server cannot be reached.** One terminating error ends the run. Exit code 1:
+
+```
+0 removed, 0 already gone, 0 skipped, 0 failed. Change log: .\changes.jsonl
+The run stopped: Lookup of 'srv01-old' (A) in zone 'contoso.local' on 'dc01' failed: Stub failure: could not read
+records of zone contoso.local on server dc01.
+exit code: 1
+```
+
+**The input file is missing.** The same:
+
+```
+0 removed, 0 already gone, 0 skipped, 0 failed. Change log: .\changes.jsonl
+The run stopped: The input file '.\missing.txt' does not exist. Check the path; a relative path is resolved from the
+current folder 'C:\Users\you\AppData\Local\Temp\DnsToolsReadmeDemo'.
+exit code: 1
+```
+
+Notes on the template:
+
+- **`-Force` is what makes it unattended.** Without it, and without a console, the
+  first item that needs an answer ends the run with the error `This session cannot
+  prompt. Re-run with -Force to confirm all actions, or -WhatIf to preview.` and
+  nothing is removed. This is `Remove-DnsEntry -InputFile .\decommissioned.txt
+  -Server dc01` in a session that cannot prompt:
+
+  ```
+  Remove-DnsEntry: This session cannot prompt. Re-run with -Force to confirm all actions, or -WhatIf to preview.
+  ```
+
+- **`-ErrorAction Stop` stops at the first failed item.** That is the cautious
+  choice for removals: the log shows exactly where the run ended, and running the
+  script again does only what is not done yet (`AlreadyDone` for the rest).
+  Without it a failed item gives an error and a `Failed` row and the run goes on.
+- **`-OutVariable results` keeps the rows.** `$results = @(Remove-DnsEntry ...)` would
+  lose them all when `-ErrorAction Stop` ends the run, because the assignment never
+  completes. The `catch` also takes preconditions that throw whatever `-ErrorAction`
+  says (a missing input file, an unreachable server).
+- **Exit codes are yours to choose.** Here 0 means nothing needs a person, 1 means
+  the run stopped or could not start, 2 means a person should read the `Skipped`
+  lines. A `Skipped` row is not an error, so `-ErrorAction Stop` does not stop for
+  it.
+- **The task's account** needs permission to change records, WMI access to
+  `root\MicrosoftDNS` on the server (or a fresh snapshot, see
+  [Requirements](#2-requirements)) for the reference check, and a writable folder for
+  the log. Always pass `-Server` and `-LogPath`.
+- **Keep the log.** Read it with the commands in [The change log](#7-the-change-log).
+  The local snapshot is not updated by the removal.
+
+### What the commands guarantee
 
 - **Preconditions throw.** In this version: no default server
   (`LOGONSERVER` not set) or an invalid server name; the `DnsServer` module is
@@ -539,11 +1369,12 @@ Notes on the template:
 - **Warnings keep going.** A stale snapshot, an unreadable snapshot file or a
   value that matches nothing give a warning and still correct output. Collect them
   with `-WarningVariable`.
-- **`-Force` means zero prompts.** Today only `Update-DnsSnapshot` has a
-  confirmation, and it asks only with `-Confirm`. In a session that cannot prompt,
-  `-Confirm` without `-Force` writes the error "This session cannot prompt.
-  Re-run with -Force to confirm all actions, or -WhatIf to preview." and does
-  nothing.
+- **`-Force` means zero prompts.** `Update-DnsSnapshot` and the change commands
+  have a confirmation. `Update-DnsSnapshot` asks only with `-Confirm`; the change
+  commands ask as described in [section 1](#1-what-dnstools-does). In a session
+  that cannot prompt, a command that needs an answer and has no `-Force` writes the
+  error "This session cannot prompt. Re-run with -Force to confirm all actions, or
+  -WhatIf to preview." and does nothing.
 - **Output streams** as objects are found, so `Select-Object -First` and
   `Export-Csv` start at once. `-Verbose` shows every server round-trip and the
   resolved defaults (server, snapshot folder).
@@ -552,69 +1383,236 @@ Notes on the template:
   snapshot export then copies the file over WinRM, because the `admin$` share
   cannot use alternate credentials.
 
-### When the change commands arrive
+### What the change commands guarantee
 
-Planned for a later phase; nothing in this section exists yet. The commands that
-change records will follow the same rules and add a result object to them:
+`Remove-DnsEntry`, `New-DnsEntry`, `Set-DnsEntry`, `New-DnsReverseZone` and
+`Backup-DnsZone` keep the rules above and add these:
 
-- They will emit one `Result` object per sub-operation (for example one for
-  removing a PTR and one for removing the A record), all sharing a `BatchId`,
-  with the properties `Action`, `Name`, `Type`, `Data`, `Result`, `Error`, `Zone`,
-  `NodeName`, `Server`, `Id`, `BatchId` and `Timestamp`. Read these objects, not
-  the console text, to see what happened.
-- `Result` will be one of `Success`, `Failed`, `Skipped`, `WhatIf`, `AlreadyDone`
-  and `Pending`. `AlreadyDone` (for example removing something that is already
-  gone) is a success, so re-running a script is safe.
-- A per-item failure will be a non-terminating error plus a `Result` object with
-  `Result = 'Failed'`; the other items continue. A precondition will throw.
-  `-ErrorAction Stop` makes the first per-item failure terminating, so the
-  remaining items are not processed.
-- `-Force` will mean zero prompts; without it an unattended session gets the
-  error "This session cannot prompt" instead of a hang.
-- As with `Get-DnsEntry` today, do not decide success or failure from
-  `-ErrorVariable`: it also collects the errors the module handled itself. Look at
-  the `Result` objects (for example `$results | Where-Object Result -eq 'Failed'`)
-  or capture the error stream with `2>&1`.
+- **One result row for every step, as it happens.** Each step (removing a PTR
+  record, adding an A record, creating a zone) writes exactly one `DnsTools.Result`
+  object, immediately, and one line to the change log. The properties are `Action`,
+  `Name`, `Type`, `Data`, `Result`, `Error`, `Zone`, `NodeName`, `Server`, `Id`,
+  `BatchId` and `Timestamp`. Read these objects, not the console text, to see what
+  happened.
+- **`Result` is one of `Success`, `Failed`, `Skipped`, `WhatIf` and `AlreadyDone`.**
+  `AlreadyDone` is a success: the record is already gone, already there with the
+  same data, the value is already set, or the zone is already hosted. `Skipped`
+  carries its reason in `Error` (a referenced name, a dynamic record, a read-only
+  zone, a reference check that could not run, a declined prompt). `Pending` is
+  reserved and is not written by these commands.
+- **A failure in one item does not stop the run.** It is a non-terminating error
+  (`ErrorId` `DnsTools.<Command>.<Reason>`, for example
+  `DnsTools.Remove-DnsEntry.PatternNotAllowed`) plus a `Failed` row. The row and its
+  log line are written before the error, so `-ErrorAction Stop` still leaves the
+  line in the log. `-ErrorAction Stop` turns the first such error into a terminating
+  one, which stops the script at the first failed item.
+- **Access denied is `Failed`, never `AlreadyDone`.**
+- **Three things end the whole run** with one terminating error, after the row of
+  the item concerned; it is not repeated for every item: a server that cannot be reached
+  (`ErrorId` `DnsTools.<Command>.ServerUnreachable`), a session that cannot prompt
+  (`DnsTools.Confirm.NonInteractive`) and the answer `S` at a prompt (`Operation
+  stopped by the operator.`). A parameter combination that cannot work (for example
+  `Set-DnsEntry` with nothing to change) is a terminating error before anything is
+  read.
+- **`-Force` means zero prompts, and nothing else.** The safety overrides are
+  separate switches: `-AllowReferenced`, `-IncludeDynamic`, `-ReplacePtr` and
+  `-SkipReferenceCheck`.
+- **A step that is already in place never asks.** The question is shown only when
+  something is to be written. If you answer `N`, every pending step of that item is
+  `Skipped` with `Declined at the confirmation prompt.` and is logged.
+- **A rehearsal never counts as a change.** `-WhatIf` creates no folder, writes no
+  record, and does not become the session's "writer server" (see the warning in
+  [Troubleshooting](#8-troubleshooting)). The rows say `WhatIf` and are logged.
+- **`-Delay <seconds>` waits once per input item**, after all of its steps, also
+  after a failed item and never under `-WhatIf` (`Remove-DnsEntry`, `New-DnsEntry`
+  and `Set-DnsEntry`). It is whole seconds.
+- **Do not decide success from `-ErrorVariable`.** As with `Get-DnsEntry`, it also
+  collects errors that the module handled itself. Look at the rows
+  (`$results | Where-Object Result -eq 'Failed'`) or capture the error stream with
+  `2>&1`.
+- **The local snapshot is not patched after a change.** With `-Verbose`,
+  `Remove-DnsEntry`, `New-DnsEntry` and `Set-DnsEntry` end a run with a reminder to
+  run `Update-DnsSnapshot`.
+- **Running a batch again is safe.** A step that was done reports `AlreadyDone`;
+  only what is left is done.
 
 ## 7. The change log
 
-No command in this version writes to the log. `Get-DnsEntry`, `Get-DnsSnapshot`
-and `Update-DnsSnapshot` change no DNS record, and none of them has a `-LogPath`
-parameter. The log writer is in the module already so that the planned change
-commands can use it; this section describes the format they will write.
+The five change commands write one line to the change log for every step, so you
+can see afterwards what was changed, by whom, and what the record looked like
+before. A step is logged whatever its result: `Success`, `AlreadyDone`, `Skipped`,
+`Failed`, and also `-WhatIf` rehearsals (`Result` = `WhatIf`), so you can review
+what a rehearsal would have done. `Get-DnsEntry`, `Get-DnsSnapshot` and
+`Update-DnsSnapshot` change no DNS record, write no log and have no `-LogPath`.
 
-The change commands will write one line per action to the log, including
-`-WhatIf` runs (`Result = 'WhatIf'`), so that you can review what a rehearsal would
-have done.
-
-The file is chosen in this order:
+**Which file.** The file is chosen in this order:
 
 1. `-LogPath <file>` (a relative path is taken from the current folder)
 2. the environment variable `DNSTOOLS_LOGPATH`
 3. `%LOCALAPPDATA%\DnsTools\log\DnsTools_<yyyy-MM>.jsonl` (one file per month)
 
-The folder is created when it is missing. The format is JSON Lines, one JSON
-object per line. Fields, in this order: `Id`, `BatchId` (shared by one command
-run), `Timestamp`, `Operator` (`DOMAIN\user`), `Server`, `Action`, `Zone`,
-`NodeName`, `Type`, `Before` (`Data`, `Ttl`, `Timestamp`, `IsStatic`), `After`,
-`Result` and `Error`. Every field is always present; `null` means "not
-applicable". Dates are ISO 8601 with offset, for example
-`2026-10-09T15:00:00.0000000+02:00`.
+The folder is created when it is missing. The file only grows; nothing deletes old
+lines.
 
-Writing the log never stops a DNS operation. If the file is locked, the writer
-waits 200 milliseconds and tries once more. If that fails too, or the path cannot
-be created, the command writes the warning `Could not write the change log
-'<path>': <reason> The change was not logged.` and carries on. Read the log with:
+**One line per step.** The format is JSON Lines: one JSON object per line. This is the
+last line of a removal, with line breaks added by `ConvertTo-Json`:
 
 ```powershell
-$log = Join-Path $env:LOCALAPPDATA ('DnsTools\log\DnsTools_{0}.jsonl' -f (Get-Date -Format 'yyyy-MM'))
-Get-Content -Encoding UTF8 $log | ConvertFrom-Json | Where-Object Result -eq Failed
+$null = Remove-DnsEntry srv01-old.contoso.local -Server dc01 -Confirm:$false -LogPath .\changes.jsonl
+Get-Content -Path .\changes.jsonl -Encoding UTF8 | Select-Object -Last 1 | ConvertFrom-Json | ConvertTo-Json -Depth 4
 ```
 
-Encoding: Windows PowerShell 5.1 writes a UTF-8 byte-order mark (BOM) when it
+```
+{
+  "Id": "8a479c22",
+  "BatchId": "4830e1d3",
+  "Timestamp": "2026-10-13T20:25:19.2212599+02:00",
+  "Operator": "CONTOSO\\admin",
+  "Server": "dc01",
+  "Action": "RemoveA",
+  "Zone": "contoso.local",
+  "NodeName": "srv01-old",
+  "Name": "srv01-old.contoso.local",
+  "Type": "A",
+  "Data": "10.0.16.9",
+  "Before": {
+    "Data": "10.0.16.9",
+    "Ttl": 3600,
+    "Timestamp": null,
+    "IsStatic": true
+  },
+  "After": null,
+  "Result": "Success",
+  "Error": null
+}
+```
+
+The fields, always in this order and always all present (`null` means "not
+applicable"):
+
+| Field | Holds |
+|---|---|
+| `Id` | A GUID for this line. It is also the `Id` of the result object that the command returned. |
+| `BatchId` | A GUID shared by every line of one command run. |
+| `Timestamp` | When the result was written, ISO 8601 with offset, for example `2026-10-09T15:00:00.0000000+02:00`. |
+| `Operator` | `DOMAIN\user` who ran the command. |
+| `Server` | The DNS server that was changed. |
+| `Action` | The step, as in the result table of [section 5](#before-you-change-anything-the-habits-and-the-result-rows). |
+| `Zone` | The zone that holds the record (for `CreateZone` the new zone). |
+| `NodeName` | The node within the zone (`@` for the apex). |
+| `Name` | The owner of the record as an FQDN; for a PTR record the reverse name. |
+| `Type` | `A`, `AAAA`, `CNAME`, `PTR`, `DHCID` or `Zone` (for `Backup`); `null` for the other zone steps. |
+| `Data` | The address or target the step is about. `Name` and `Data` are on every line, so even a `WhatIf` or `Failed` line without `Before` and `After` says which record it concerns. |
+| `Before` | The record before the step: `Data`, `Ttl`, `Timestamp` (`null` for a static record) and `IsStatic`. |
+| `After` | The record after the step, with the same four keys. |
+| `Result` | `Success`, `Failed`, `Skipped`, `WhatIf` or `AlreadyDone`. |
+| `Error` | Why the step was skipped or failed. |
+
+**What `Before` and `After` hold.** They are the whole record, so that a change can
+be put back by hand:
+
+| Steps | `Before` | `After` |
+|---|---|---|
+| `RemovePtr`, `RemoveA`, `RemoveAAAA`, `RemoveCName`, `RemoveDhcid` | The record that was removed (`Success` only). | `null` |
+| `AddA`, `AddAAAA`, `AddPtr`, `AddCName` | `null`, except for `AlreadyDone`: the record that was already there. | The new record, read back from the server (`Success` only). |
+| `SetTtl`, `SetAddress`, `SetPtrTarget`, `SetTarget` | The record as it was read before the change. Also on `WhatIf`, `Skipped`, `Failed` and `AlreadyDone`. | The record read back after the change (`Success` only). `After.Timestamp` is `null` on Windows Server 2025: a changed record is static (see [Known limitations](#9-known-limitations)). |
+| `CreateZone`, `SetZoneAging`, `Backup` | `null` | `null` |
+
+For a `RemovePtr` that `New-DnsEntry -ReplacePtr` or `Set-DnsEntry -Address` does,
+`Before` is the PTR record that was removed. `AddPtr` has `After` as above.
+
+**Reading the log.** Always read it with `-Encoding UTF8` (see below). The monthly
+file of the default location:
+
+```powershell
+$null = Remove-DnsEntry srv01-old.contoso.local -Server dc01 -Confirm:$false
+$log = Join-Path $env:LOCALAPPDATA ('DnsTools\log\DnsTools_{0}.jsonl' -f (Get-Date -Format 'yyyy-MM'))
+Get-Content -Encoding UTF8 $log | ConvertFrom-Json | Format-Table Timestamp, Action, Name, Result
+```
+
+```
+Timestamp           Action    Name                    Result
+---------           ------    ----                    ------
+2026-10-13 20:25:19 RemovePtr 9.16.0.10.in-addr.arpa  Success
+2026-10-13 20:25:19 RemoveA   srv01-old.contoso.local Success
+```
+
+Read a file with `-LogPath` the same way and turn it into objects with
+`ConvertFrom-Json`:
+
+```powershell
+$null = Remove-DnsEntry srv01-old.contoso.local, app01-old.contoso.local -Server dc01 -Confirm:$false -LogPath .\changes.jsonl
+$null = New-DnsEntry -Name srv10.contoso.local -Address 10.0.16.110 -Server dc01 -LogPath .\changes.jsonl
+$log = Get-Content -Path .\changes.jsonl -Encoding UTF8 | ConvertFrom-Json
+$log | Format-Table Timestamp, Action, Name, Result
+```
+
+```
+Timestamp           Action    Name                     Result
+---------           ------    ----                     ------
+2026-10-13 20:25:19 RemovePtr 9.16.0.10.in-addr.arpa   Success
+2026-10-13 20:25:19 RemoveA   srv01-old.contoso.local  Success
+2026-10-13 20:25:19 RemovePtr 31.16.0.10.in-addr.arpa  Success
+2026-10-13 20:25:19 RemoveA   app01-old.contoso.local  Success
+2026-10-13 20:25:19 AddA      srv10.contoso.local      Success
+2026-10-13 20:25:19 AddPtr    110.16.0.10.in-addr.arpa Success
+```
+
+**Find one run, with `BatchId`.** Every row that a command returns has the
+`BatchId` of its lines in the log. This shows the last batch of the file:
+
+```powershell
+$null = Remove-DnsEntry srv01-old.contoso.local, app01-old.contoso.local -Server dc01 -Confirm:$false -LogPath .\changes.jsonl
+$null = New-DnsEntry -Name srv10.contoso.local -Address 10.0.16.110 -Server dc01 -LogPath .\changes.jsonl
+$log = Get-Content -Path .\changes.jsonl -Encoding UTF8 | ConvertFrom-Json
+$batchId = $log[-1].BatchId
+$log | Where-Object BatchId -eq $batchId | Format-Table Action, Name, Result
+```
+
+```
+Action Name                     Result
+------ ----                     ------
+AddA   srv10.contoso.local      Success
+AddPtr 110.16.0.10.in-addr.arpa Success
+```
+
+**Find what was skipped or failed:**
+
+```powershell
+$null = Remove-DnsEntry dc01.contoso.local, srv01-old.contoso.local -Server dc01 -Confirm:$false -LogPath .\changes.jsonl
+Get-Content -Path .\changes.jsonl -Encoding UTF8 | ConvertFrom-Json | Where-Object Result -in 'Skipped', 'Failed' | Format-List Action, Name, Result, Error
+```
+
+```
+Action : RemovePtr
+Name   : 10.16.0.10.in-addr.arpa
+Result : Skipped
+Error  : Referenced by 1 SRV and 1 NS records (_ldap._tcp.contoso.local, contoso.local). Add -AllowReferenced to remove
+          it anyway.
+
+Action : RemoveA
+Name   : dc01.contoso.local
+Result : Skipped
+Error  : Referenced by 1 SRV and 1 NS records (_ldap._tcp.contoso.local, contoso.local). Add -AllowReferenced to remove
+          it anyway.
+```
+
+**When the log cannot be written.** Writing the log never stops a DNS change. If
+the file is locked, the writer waits 200 milliseconds and tries once more. If that
+fails too, or the path cannot be created, the command writes the warning `Could not
+write the change log '<path>': <reason> The change was not logged.` (once for every
+line that could not be written) and carries on. The change is done; only the line
+is missing. See [Troubleshooting](#8-troubleshooting).
+
+**Encoding.** Windows PowerShell 5.1 writes a UTF-8 byte-order mark (BOM) when it
 *creates* the file; PowerShell 7 does not. A BOM is never written mid-file and
 both editions read either, so the log can be shared. Keep `-Encoding UTF8` when
 you read it, or Windows PowerShell 5.1 garbles non-ASCII characters.
+
+**Undoing a change.** `Undo-DnsChange`, which will read these lines and put the
+`Before` records back, is planned for phase 4. It does not exist in this version.
+Until then the log tells you what to put back by hand, and `Backup-DnsZone` before a
+clean-up gives you the whole zone as it was.
 
 ## 8. Troubleshooting
 
@@ -775,8 +1773,9 @@ PTR record(s) in '<zone>' point at: <targets>. These PTR records are orphaned
 (Get-DnsIssue in a later phase reports them)."** The address has PTR
 records, but no A or AAAA record uses it: the host is gone and its PTR stayed
 behind. Decide whether the targets still exist (`Get-DnsEntry -Find <target>`) and,
-if not, remove the PTR records in DNS Manager or with the DnsServer cmdlets. Today
-no DnsTools command removes them.
+if not, remove the PTR records: `Remove-DnsEntry <address>` removes the PTR records
+of an address that point at names without an A or AAAA record (see
+[Remove records](#remove-records-remove-dnsentry)).
 
 **Error "Lookup of '<node>' (<type>) in zone '<zone>' on '<server>' failed:
 <reason>"** (ErrorId `DnsTools.Get-DnsLiveRecord.LookupFailed`). The server
@@ -803,14 +1802,300 @@ queries. Add `-Zone`.
 10.0.50.0/24 or fd00::/8); it is ignored."** A `-MarkDhcpRange` entry is
 misspelled. The other entries are still used.
 
+### Changing records
+
+These are the messages of `Remove-DnsEntry`, `New-DnsEntry`, `Set-DnsEntry`,
+`New-DnsReverseZone` and `Backup-DnsZone`. `<name>`, `<server>`, `<zone>`,
+`<address>` and similar stand for the actual values. A `Skipped` or `Failed` row
+carries the text in its `Error` column (`Format-List Action, Name, Result, Error`
+shows it whole). A `Failed` row also gives an error with an `ErrorId` of the form
+`DnsTools.<Command>.<Reason>`, for example `DnsTools.New-DnsEntry.NoReverseZone`.
+Warnings appear as `WARNING:` lines. Where the commands word the same problem
+differently, each wording is quoted.
+
+#### An item was skipped
+
+**Skipped: "Referenced by <counts> <records> (<owners>). Add -AllowReferenced to
+remove it anyway."**
+(`Remove-DnsEntry`.) NS, SRV or MX records point at the name; typically a domain
+controller or a mail server. A real text reads `Referenced by 1 SRV and 1 NS records
+(_ldap._tcp.contoso.local, contoso.local). Add -AllowReferenced to remove it
+anyway.` At most three owners are listed, then `...`. The whole item is skipped, one
+row for every record that would have been removed. Leave the name alone, or remove
+the records that point at it first. If you are sure, add `-AllowReferenced`; it
+removes the name and writes the warning "'<name>': <the text above, without its last
+sentence> It is removed anyway (-AllowReferenced); those records will point at a
+missing name."
+
+**Skipped: "The reference check could not run (root\MicrosoftDNS on '<server>' is not
+reachable). Run Update-DnsSnapshot first, or pass -SkipReferenceCheck."**
+(`Remove-DnsEntry`.) To know what points at a name, the command reads a snapshot
+that is younger than `-MaxSnapshotAge` (24 hours by default) and otherwise asks the
+server over WMI. Neither worked. Run `Update-DnsSnapshot -Server <server>` and try
+again, or make WMI reachable (CIM over WinRM or DCOM, and permission to read
+`root\MicrosoftDNS`). `-AllowReferenced` does not help here. `-SkipReferenceCheck`
+removes the names without looking and writes the warning "-SkipReferenceCheck: SRV,
+NS, MX and CNAME records that point at the names in this run are not looked for on
+'<server>'. Referenced names are changed anyway and their CNAME aliases stay
+behind."
+
+**Skipped: "Dynamic record, owned by the client or the DHCP server; re-register it
+instead, or pass -IncludeDynamic."**
+(`Set-DnsEntry`.) The record has an aging timestamp, so a client or the DHCP server
+owns it. Let the client register it again, or add `-IncludeDynamic`. Every dynamic
+record that is then changed gives the warning "Changing the dynamic <type> record
+'<name>' (<data>) because of -IncludeDynamic; the client or the DHCP server may
+register the old value again." (`<type>` is `A`, `AAAA` or `PTR`), and the record
+becomes static. `Remove-DnsEntry` does not skip dynamic records. It removes them and
+writes the warning "'<name>' (<type> <data>) is a dynamic record. The client or the
+DHCP server may register it again; see the notes in Get-Help Remove-DnsEntry
+-Full." In an Active Directory-integrated zone the removed name stays as a
+tombstoned object for about 7 days, and that object keeps the old permissions: with
+secure dynamic updates only the previous owner can register the name again until
+the tombstone is gone.
+
+**Skipped: the zone is read-only.** The server holds the zone as a secondary or stub
+zone, or the server created it itself. The text differs by command:
+
+- `Remove-DnsEntry`: "Zone '<zone>' is not writable on this server ('<server>' holds
+  it as a <type> zone). Remove the record on the server that hosts the primary
+  zone." (`<type>` is `Secondary`, `Stub` or `automatically created`. A PTR record in
+  a read-only reverse zone does not stop the A record from being removed; a
+  read-only forward zone skips the whole name.) For a stub or forwarder zone: "Zone
+  '<zone>' is a <type> zone on '<server>'; its records are not hosted there. Remove
+  the record on the server that hosts the zone."
+- `Set-DnsEntry`: "Zone '<zone>' is not writable on '<server>' (zone type <type>);
+  change the record on a server that hosts the primary zone."
+- `New-DnsEntry`: "Zone '<zone>' is read-only on '<server>' (not a primary copy).
+  Create the record on the server that hosts the primary zone." (For a step that
+  removes a PTR record it ends "Change it on the server that hosts the primary
+  zone.")
+
+Run the command with `-Server` set to a server that hosts the primary copy. (An
+Active Directory-integrated zone is primary on every domain controller that hosts it.)
+
+**Skipped: "Declined at the confirmation prompt."** You answered `N`, or just pressed
+Enter, at the question. Every pending step of that item is skipped and logged. Run
+the command again to be asked again.
+
+**Skipped: "Kept to avoid an orphaned PTR: a PTR record that points at '<name>' could
+not be removed."** (`Remove-DnsEntry`, on the row of the A or AAAA record.) The row
+above it, `RemovePtr` with `Failed`, says why (often access denied). The A record is
+kept so that no PTR record is left without its host. Fix the cause and run the same
+command again. Two related texts on later steps: "Kept because '<name>' still has an
+A or AAAA record." (the DHCID record) and "Kept because '<name>' was not removed."
+(an alias).
+
+**Skipped: "<address> already has a PTR record for '<names>'. Add -ReplacePtr to
+replace it with one for '<name>'."** (`New-DnsEntry`.) The A record was created (or
+already existed), but the address already has a PTR record that points at another
+name. It is left alone. If that PTR record is stale, add `-ReplacePtr` and run the
+command again. `Set-DnsEntry -Address` says "The PTR record <reverse name> already
+points at <names>. Add -ReplacePtr to replace it."
+
+**"Removed by the DNS server together with the A record; -KeepPtr cannot be honoured
+on this server."** (`Remove-DnsEntry -KeepPtr`: a `RemovePtr` row with `Success`,
+plus the same text as one warning per run.) Windows Server 2025 deletes the PTR
+record when its A record is removed. It is not an error. DnsTools never re-creates
+the PTR record. A similar text from `Set-DnsEntry`: "Removed by the DNS server
+together with the A record change." It appears when `root\MicrosoftDNS` is not
+available, so the TTL is changed with `Set-DnsServerResourceRecord`, which makes the
+server delete the PTR record; `Set-DnsEntry` adds it again (an `AddPtr` row) and
+writes the warning "root\MicrosoftDNS on '<server>' is not available; TTL changes of
+A/AAAA records re-create their PTR records." Make WMI reachable to avoid it.
+
+#### An item failed before anything was written
+
+**"'<value>' is a pattern. Change commands take exact names or addresses; find the
+entries with Get-DnsEntry -Find '<value>', check them, and pipe them to this
+command."** (`PatternNotAllowed`.) The value has `*` or `?`. Do what the message
+says.
+
+**ZoneNotFound.** The change command could not tell which zone the name belongs to:
+
+- "'<value>' is not a fully qualified name. Use the FQDN (for example
+  <name>.contoso.local), or specify -Zone."
+- "'<value>' is not in any forward zone hosted on '<server>'. Check the spelling, or
+  specify the -Server that hosts its zone." (For a reverse name such as
+  `5.16.0.10.in-addr.arpa` the hint is "Reverse lookup names are not accepted; give
+  the IP address instead.")
+- "Zone '<zone>' is not hosted on '<server>'. Check -Zone (or the Zone column), or
+  specify another -Server."
+- "'<value>' is not inside zone '<zone>'. Remove -Zone (or the Zone column) to use
+  the zone the name belongs to."
+- "The zone '<zone>' of entry '<name>' is not hosted on '<server>'. Run the command
+  against the server the entry came from (-Server), or read the entry again from
+  this server with Get-DnsEntry." (A piped entry names a zone that this server does
+  not host.)
+
+**NoReverseZone: "No reverse lookup zone on '<server>' covers <address>, so its PTR
+record cannot be created, and '<name>' is not created either. Add -NoPtr to create
+the record without a PTR record, or -CreateReverseZone to create the zone <zone>
+(<network>) first."** (`New-DnsEntry`.) No reverse zone on the server covers the
+address, so the host is not created. If the host already has its A record, the middle
+reads "although '<name>' already has its <type> record". Choose `-NoPtr`, or
+`-CreateReverseZone`, or create the zone yourself with `New-DnsReverseZone` (a
+file-backed or Legacy forward zone needs that: `-CreateReverseZone` cannot pass
+`-ReplicationScope`). `Set-DnsEntry -Address` does not fail for this: it removes the
+old PTR record, changes the address, skips the new PTR record and writes the warning
+"No reverse zone for <address> is hosted on '<server>', so no PTR record was added.
+Create the zone with New-DnsReverseZone and run Set-DnsEntry again."
+
+**NodeIsCname: "'<name>' is an alias (CNAME for '<target>'). A name with an alias
+cannot have other records; remove the alias first, or choose another name."**
+(`New-DnsEntry -Address`.) A name that is an alias cannot also have an A record.
+Remove the alias with `Remove-DnsEntry`, or pick another name.
+
+**CnameCollision: "'<name>' already has <types> record(s). An alias (CNAME) cannot
+share its name with other records; remove them first, or choose another name."**
+(`New-DnsEntry -Target`; `<types>` is for example `A`.) The alias name is already
+used by other records.
+
+**Delegated: "'<name>' lies below '<label>.<zone>', which is delegated to other name
+servers (<servers>). Create the record in the delegated zone, on a server that hosts
+it."** (`New-DnsEntry`.) An NS record between the name and the zone hands the part
+below it to other servers. Another `Delegated` text: "The PTR record of <address> is
+delegated (RFC 2317): '<reverse name>' is an alias for '<target>', whose zone is not
+hosted on '<server>'. Create the PTR record on the server that hosts that zone, or
+add -NoPtr."
+
+**"'<name>' already has <type> <address>, with a TTL of <n> s instead of the requested
+<m> s. Change it with Set-DnsEntry -TTL <m>."** (A warning from `New-DnsEntry`; the
+row is `AlreadyDone`.) The record exists with another TTL. `New-DnsEntry` does not
+change existing records.
+
+**"Nothing to change. Specify at least one of -TTL, -Address, -PtrTarget or -Target."**
+and **"-Address, -PtrTarget and -Target change different records. Give only one of
+them per call; -TTL can be combined with any of them."** (`Set-DnsEntry`,
+terminating errors, nothing was read.)
+
+**Ambiguous: "'<name>' has <n> A/AAAA records (<addresses>); -Address changes exactly
+one. Pipe the entry to change from Get-DnsEntry, for example: Get-DnsEntry '<name>'
+-Server <server> | Where-Object Data -eq '<address>' | Set-DnsEntry -Address
+<new address> -Server <server>"** (`Set-DnsEntry`.) The name has several A records.
+Pipe the one you mean. A similar text: "-Target changes the target of an alias
+(CNAME), but '<name>' has A/AAAA records and no CNAME." (`NotACname`).
+
+**"-NoPtr cannot be combined with -CreateReverseZone or -ReplacePtr: with -NoPtr no
+PTR record is created, replaced or given a zone. Remove one of them."**
+(`New-DnsEntry`, terminating.)
+
+**New-DnsReverseZone:**
+
+- "An IPv4 reverse zone covers a /8, /16 or /24 network; '<network>' has prefix
+  /<prefix>. Use <allowed> instead." (`InvalidNetworkId`, terminating, before the
+  server is contacted. An IPv6 prefix must be a multiple of 4.)
+- "Zone '<zone>' (-CopySettingsFrom) is not hosted on '<server>'. Give a zone hosted
+  on that server; the new zone copies its replication, dynamic update and aging
+  settings." (`ZoneNotFound`; a `Failed` `CreateZone` row.)
+- "Zone '<zone>' is not stored in Active Directory (file-backed), so the new zone
+  cannot copy its directory partition. Specify -ReplicationScope (Domain, Forest,
+  Legacy or Custom)." (`ReplicationScopeRequired`; for a Legacy source zone the
+  middle reads "uses the Legacy replication scope".)
+- The warning "Zone '<zone>' was created on '<server>'. Other domain controllers see
+  it only after Active Directory replication plus their DsPollingInterval (180
+  seconds by default); until then, create its records on '<server>'." appears after
+  every creation. It is not an error: use the same `-Server` until the zone has
+  replicated.
+
+**Backup-DnsZone:**
+
+- "Zone '<zone>' is not hosted on '<server>'. Check the name, or list the zones with
+  Get-DnsServerZone -ComputerName <server>." (`ZoneNotFound`; a `Failed` row, the
+  other zones go on.)
+- "Zone '<zone>' on '<server>' cannot be exported because <reason>. Only primary
+  zones are exported; export it on the server that hosts the primary copy."
+  (`ZoneNotExportable`; `<reason>` is for example "it is a Secondary zone".)
+- "The backup folder '<folder>' already exists and is never reused, so that an
+  earlier backup is not overwritten. Wait a second and run the command again, or
+  specify another -Path."
+
+**Input files (`-InputFile`).** The command stops before it changes anything, with
+one of: "The input file '<path>' does not exist. Check the path; a relative path is
+resolved from the current folder '<folder>'." / "The input file '<path>' is empty
+(only blank lines or '#' comments). Put one name or address per line, or a CSV
+header with a Name column and one row per entry." / "The input file '<path>' has a
+CSV header but no rows. Add one row per entry below the header." A CSV column
+that the command does not know gives the warning "The input file '<path>' has
+column(s) that are ignored: <columns>. Known columns: Name, Address, Target, TTL,
+Zone." Save the file as UTF-8 (with a BOM from Windows PowerShell 5.1) for names
+with non-ASCII characters.
+
+#### The run, the session and the server
+
+**Warning "This session already changed DNS on '<server 1>'; changes on '<server 2>'
+may be lost if both touch the same node before replication."** A change command ran
+on a second server in the same PowerShell session. Active Directory replicates
+changes between domain controllers, and two changes to the same node on two servers
+can overwrite each other. Stay on one server (`-Server`) for a batch, and start a
+new session for the other server. A `-WhatIf` run does not count.
+
+**Error "This session cannot prompt. Re-run with -Force to confirm all actions, or
+-WhatIf to preview."** (`DnsTools.Confirm.NonInteractive`; see also
+[Prompts, language mode and files](#prompts-language-mode-and-files).) A change
+command needed an answer and the session has no console: a scheduled task,
+`-NonInteractive`, a remote command. The run ends at the first item and changes
+nothing. Add `-Force` (or `-Confirm:$false`) for an unattended run, or `-WhatIf` to
+preview.
+
+**ServerUnreachable.** The server could not be reached (RPC 1722, or a WinRM or CIM
+transport failure). The row of the item concerned is `Failed`, then one terminating
+error ends the run, and the rest of the input is not processed. The text differs a
+little by command:
+
+- `Remove-DnsEntry` and `New-DnsReverseZone`: "The DNS server '<server>' cannot be
+  reached: <reason> The run was stopped; the remaining input was not processed.
+  Check the server and run the command again."
+- `New-DnsEntry` and `Set-DnsEntry`: the same text as `Remove-DnsEntry`.
+
+Check the server name, that the DNS Server service runs and that WinRM or CIM is
+reachable, then run the same command again; what was done reports `AlreadyDone`.
+
+**A lookup failed.** The command could not read the records of an item, so it does
+not guess. `Remove-DnsEntry`: "'<name>' was not changed because a lookup failed:
+<reason>" (`LookupFailed`). `Set-DnsEntry`: "Could not read the records of '<name>'
+on '<server>': <reason>". `New-DnsEntry`: "Lookup of '<node>' (<type>) in zone
+'<zone>' on '<server>' failed: <reason>". The `<reason>` is the text of the
+DnsServer cmdlet, for example access denied. Fix the cause and run the command
+again.
+
+**A write failed.** "Could not remove the <type> record '<data>' of '<node>' in zone
+'<zone>': <reason>", "Could not create <type> record '<name>' -> '<data>' in zone
+'<zone>': <reason>", "Could not change the <type> record '<node>' -> '<data>' in zone
+'<zone>': <reason>" and "Could not create zone '<zone>' on '<server>': <reason>". The
+`<reason>` is the DnsServer cmdlet's text. Access denied (Win32 error 5) is
+`Failed`, never `AlreadyDone`: your account may not change that zone.
+
+**Warning "Could not write the change log '<path>': <reason> The change was not
+logged."** The change was made, but its line could not be written: the folder is not
+writable, the file is locked for longer than 200 milliseconds, or the path is not
+valid. You get one warning for every line. Fix the path (`-LogPath`, or
+`DNSTOOLS_LOGPATH`) and read the rows of the command to see what was done.
+
+**Warning "A records without a PTR cannot be found by address without a snapshot. No
+snapshot of '<server>' exists, so only the names that PTR records point at are
+removed; run Update-DnsSnapshot -Server <server> first to find the others too."**
+(`Remove-DnsEntry` with an IP address.) Without a snapshot the command finds A
+records only through the PTR records of the address.
+
+**Warning "The entry '<name>' was read from '<server 1>', but this command changes
+'<server 2>'. It is read again and removed on '<server 2>'."** A piped entry came from
+another server than `-Server`. `Set-DnsEntry` says "The entry '<name>' was read from
+'<server 1>' but is changed on '<server 2>'." Check that you meant this.
+
+**Warning "Zone '<zone>' on '<server>' has zone scopes besides the default
+(<scopes>). Remove-DnsEntry changes the default scope only; records in the other
+scopes stay."** The zone has extra zone scopes. Only the default scope is changed.
+
 ### Prompts, language mode and files
 
 **"This session cannot prompt. Re-run with -Force to confirm all actions, or
 -WhatIf to preview."** (ErrorId `DnsTools.Confirm.NonInteractive`.) The command
 needed confirmation and the session is not interactive (scheduled task, remote
 command, `-NonInteractive`). Add `-Force` to confirm everything, or `-WhatIf` to
-preview. In this version only `Update-DnsSnapshot -Confirm` can ask. If you
-answer `S` at a prompt, the command stops with "Operation stopped by the operator."
+preview. `Update-DnsSnapshot -Confirm` and the change commands can ask (see
+[Changing records](#changing-records)). If you answer `S` at a prompt, the command
+stops with "Operation stopped by the operator."
 
 **"Only core types are supported in this language mode"** (or "Method invocation
 is supported only on core types"). Your session is in Constrained Language Mode and
@@ -861,22 +2146,69 @@ blocks it. See [Installation](#3-installation-step-by-step) and
   followed by three digits is therefore ambiguous and is read as the escape.
 - **IPv6 reverse lookups only at nibble boundaries**, and **only the default zone
   scope is exported**; other zone scopes are not in snapshots.
-- **Classless (RFC 2317) reverse zones are detected, not repaired.** They are
-  classified (`Delegated`); no command creates or fixes their records yet.
+- **Classless (RFC 2317) reverse zones are detected, not created or repaired.** They
+  are classified (`Delegated`). `New-DnsEntry` puts a PTR record into a classless
+  zone that the server hosts, but no command creates such a zone or repairs its
+  records. `New-DnsReverseZone`, and so `New-DnsEntry -CreateReverseZone`, make IPv4
+  zones for /8, /16 and /24 networks and IPv6 zones on a nibble boundary only.
 - **Live lookup failures are followed by "No entry matched".** The errors say why.
 - **`-ErrorVariable` and `$Error` also hold the silenced "not found" answers** of
   the DnsServer cmdlets. Use `2>&1` to tell real errors from them.
 - **`Export-Csv` writes list properties as `System.String[]`.** Join `PtrTargets`,
   `SharedWith`, `Aliases` and `ReferencedBy` first (see the template in
   [Automation](#6-automation)).
-- **Aging timestamps cannot be restored.** For the planned change commands: a
-  record that is deleted and recreated gets a new timestamp; only its data comes
-  back. Timestamps in snapshots are as old as the export.
+- **Every change makes a record static, and aging timestamps cannot be restored.**
+  On the Windows Server 2025 server of the live test (2026-10-13), every change of
+  a record clears its aging timestamp: `Set-DnsEntry` leaves a changed record
+  static, also one that was dynamic and changed with `-IncludeDynamic`, and
+  `Before.Timestamp` in the change log keeps the old timestamp. A record that is
+  removed and created again is static too; only its data comes back. The client or
+  the DHCP server may register a dynamic record again. Timestamps in snapshots are
+  as old as the export.
+- **The snapshot is not patched after a change, and snapshot searches show the state
+  at export time.** `Remove-DnsEntry`, `New-DnsEntry` and `Set-DnsEntry` do not
+  change the local snapshot, so pattern and substring searches, address lookups
+  through the snapshot and the `SharedWith`, `Aliases` and `ReferencedBy` properties
+  show the old state until you run `Update-DnsSnapshot`. `Remove-DnsEntry` uses a
+  snapshot for its reference check only if it is younger than `-MaxSnapshotAge`.
+- **The server may delete a PTR record by itself, depending on its version.** On the
+  tested Windows Server 2025, the server deletes the PTR record that points at an A
+  record's name whenever that A record is removed or changed, by any method; older
+  servers commonly leave it. DnsTools removes PTR records first itself, reads them
+  again afterwards and reports what the server did (`-KeepPtr` may be overruled by
+  the server). Check what your own servers do before you rely on either behaviour.
+- **TTL changes go through WMI.** `Set-DnsEntry -TTL` uses the WMI method `Modify` in
+  `root\MicrosoftDNS`, because `Set-DnsServerResourceRecord` makes the server delete
+  the PTR record. Without WMI access it uses the DnsServer cmdlet, adds the PTR
+  records again and warns. That fallback is covered by the stub tests; it was not
+  tried against a live server.
+- **A CNAME that points at itself is accepted.** The server accepts it, and DnsTools
+  does not detect alias loops in this version. Check the target of `New-DnsEntry
+  -Target` and `Set-DnsEntry -Target`.
+- **`-Delay` is whole seconds**, as with `Restart-Computer -Delay`. It waits once for
+  every input item, not for every record.
+- **What the change commands leave alone.** `Remove-DnsEntry` removes only A, AAAA,
+  CNAME, PTR and DHCID records. It does not remove the NS, SRV or MX records that
+  point at a name, does not follow an alias of an alias and does not remove the
+  parent-zone CNAME of an RFC 2317 delegation. `New-DnsEntry` and `Set-DnsEntry`
+  accept no wildcard names and no other record types. All change commands change one
+  server at a time (Active Directory replication carries the change to the other
+  domain controllers), and `Remove-DnsEntry` changes the default zone scope only (it
+  warns when a zone has other zone scopes).
+- **Verified live on Windows Server 2025 only.** The change commands were tested
+  against a domain controller running Windows Server 2025 on 2026-10-13 (a test
+  zone and two test reverse zones). Other server versions were not.
 - **`Owner` is always `$null`** in this version. It is reserved for a later phase
   and will need a Full-language session.
 - **Constrained Language Mode with the `DnsServer` module is not yet verified**
-  on a policy-enforced host. The phase 1 commands are exercised in a constrained
-  session against stand-ins for the DnsServer cmdlets.
+  on a policy-enforced host. The read commands, and `Remove-DnsEntry`,
+  `New-DnsEntry`, `Set-DnsEntry` and `Backup-DnsZone` under `-WhatIf`, are exercised
+  in a constrained session against stand-ins for the DnsServer cmdlets.
 - The performance figures in the design (for example parsing 550 000 lines in
   under 20 seconds) are targets, not promises, and the duration of a zone export
   and its effect on the server for a zone of that size have not been measured yet.
+- **Do not merge streams into the output** (`*>&1`, `3>&1`) when a script captures
+  the Result objects of a change command: the warning and information records
+  would be mixed into the objects the script reads. Use `-WarningVariable`,
+  `-InformationVariable` and `-ErrorVariable` instead, as the automation template
+  in section 6 does.

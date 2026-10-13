@@ -899,7 +899,11 @@
 
                         $zonePresent = $false
                         foreach ($zoneResult in @($zoneResults)) {
-                            if ($null -ne $zoneResult -and $zoneResult.Action -eq 'CreateZone' -and @('Success', 'AlreadyDone', 'WhatIf') -contains $zoneResult.Result) {
+                            # A caller's *>&1 merges warning records into -OutVariable; only Result objects count.
+                            if ($null -eq $zoneResult -or @($zoneResult.PSObject.TypeNames) -notcontains 'DnsTools.Result') {
+                                continue
+                            }
+                            if ($zoneResult.Action -eq 'CreateZone' -and @('Success', 'AlreadyDone', 'WhatIf') -contains $zoneResult.Result) {
                                 $zonePresent = $true
                             }
                         }
@@ -998,7 +1002,7 @@
                         }
                         Write-DnsResult -Batch $batch @splat -Result 'Failed' -ErrorMessage $removal['Error']
                         if ($removal['Unreachable']) {
-                            Write-Error -Message "The DNS server '$serverKey' cannot be reached: $($removal['Error']) The batch was stopped; the remaining items were not processed. Check the server or specify another -Server, then run the command again (records that already exist report AlreadyDone)." -Category ConnectionError -ErrorId 'DnsTools.New-DnsEntry.ServerUnreachable' -TargetObject $splat['Name'] -ErrorAction Stop
+                            Write-Error -Message "The DNS server '$serverKey' cannot be reached: $($removal['Error']) The run was stopped; the remaining input was not processed. Check the server and run the command again." -Category ConnectionError -ErrorId 'DnsTools.New-DnsEntry.ServerUnreachable' -TargetObject $splat['Name'] -ErrorAction Stop
                         }
                         Write-Error -Message $removal['Error'] -Category WriteError -ErrorId 'DnsTools.New-DnsEntry.RemoveFailed' -TargetObject $splat['Name']
                         continue
@@ -1052,7 +1056,7 @@
                     $addMessage = "Could not create $($splat['Type']) record '$($splat['Name'])' -> '$($splat['Data'])' in zone '$($splat['Zone'])': $($outcome['Error'])"
                     Write-DnsResult -Batch $batch @splat -Result 'Failed' -ErrorMessage $addMessage
                     if ($outcome['Unreachable']) {
-                        Write-Error -Message "The DNS server '$serverKey' cannot be reached: $($outcome['Error']) The batch was stopped; the remaining items were not processed. Check the server or specify another -Server, then run the command again (records that already exist report AlreadyDone)." -Category ConnectionError -ErrorId 'DnsTools.New-DnsEntry.ServerUnreachable' -TargetObject $splat['Name'] -ErrorAction Stop
+                        Write-Error -Message "The DNS server '$serverKey' cannot be reached: $($outcome['Error']) The run was stopped; the remaining input was not processed. Check the server and run the command again." -Category ConnectionError -ErrorId 'DnsTools.New-DnsEntry.ServerUnreachable' -TargetObject $splat['Name'] -ErrorAction Stop
                     }
                     Write-Error -Message $addMessage -Category WriteError -ErrorId 'DnsTools.New-DnsEntry.AddFailed' -TargetObject $splat['Name']
                 }
@@ -1094,7 +1098,7 @@
                 }
 
                 if ($failure['Unreachable']) {
-                    Write-Error -Message "The DNS server '$serverKey' cannot be reached: $($failure['Message']) The batch was stopped; the remaining items were not processed. Check the server or specify another -Server, then run the command again (records that already exist report AlreadyDone)." -Category ConnectionError -ErrorId 'DnsTools.New-DnsEntry.ServerUnreachable' -TargetObject $label -ErrorAction Stop
+                    Write-Error -Message "The DNS server '$serverKey' cannot be reached: $($failure['Message']) The run was stopped; the remaining input was not processed. Check the server and run the command again." -Category ConnectionError -ErrorId 'DnsTools.New-DnsEntry.ServerUnreachable' -TargetObject $label -ErrorAction Stop
                 }
                 Write-Error -Message $failure['Message'] -Category $failure['Category'] -ErrorId ('DnsTools.New-DnsEntry.' + $failure['Reason']) -TargetObject $label
             }

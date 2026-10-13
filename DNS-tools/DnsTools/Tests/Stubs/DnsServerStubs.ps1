@@ -13,7 +13,8 @@
                  Remove-DnsServerResourceRecord, Set-DnsServerResourceRecord,
                  Add-DnsServerPrimaryZone, Set-DnsServerZoneAging,
                  Get-DnsServerZoneScope, and the CIM cmdlets New-CimSession,
-                 Remove-CimSession and Get-CimInstance (root\MicrosoftDNS WQL)
+                 Remove-CimSession, Get-CimInstance (root\MicrosoftDNS WQL) and
+                 Invoke-CimMethod (Modify on a record instance)
 
     plus the helpers Reset-DnsStubStore, Add-DnsStubZone and Add-DnsStubRecord.
 
@@ -61,7 +62,17 @@
         ZoneScopes @{}       lower-case zone name -> string[] of extra zone scopes
                              returned by Get-DnsServerZoneScope after the default scope
         CimUnavailable       $true makes New-CimSession fail (WinRM and DCOM), so that
-                             Get-DnsCimSession returns $null
+                             Get-DnsCimSession returns $null: the reference check is
+                             Unavailable and Set-DnsLiveRecord cannot change a TTL over
+                             WMI (WmiUnavailable)
+        DeletesPtrWithHost   $true (the default, Windows Server 2025 as measured on
+                             2026-10-13): removing an A/AAAA record, changing it with
+                             Set-DnsServerResourceRecord, or changing its address with
+                             Invoke-CimMethod Modify deletes the PTR of its address that
+                             points at its name (Remove-DnsStubImplicitPtr). $false
+                             models the older servers, where that PTR stays
+        ImplicitPtrDeletes   string[] of '<PTR owner> -> <target>' for every PTR the
+                             stubs deleted that way, in order
         NextId               last record Id handed out
 
     Stubs for state-changing cmdlets declare SupportsShouldProcess like the real
@@ -80,6 +91,13 @@
     copies, RecordData included, so two reads give two independent objects (the
     "fetch twice" pattern of Set-DnsLiveRecord) and changing a returned record
     never changes the store.
+
+    Server behaviour that DnsTools has to live with (CONTRACTS.md sections 7.5 and
+    13.9) is modelled where it was measured: the PTR deletion above (switch
+    DeletesPtrWithHost), every change makes the record static (Set-DnsServerResourceRecord
+    and Invoke-CimMethod clear Timestamp), and a CNAME that points at itself is
+    refused by the Set-DnsServerResourceRecord stub with 9707 (kept for the error
+    path; the measured server accepted it).
 
     Errors carry the Win32 codes of winerror.h (CONTRACTS.md section 13.9) as
     'WIN32 <code>' in the FullyQualifiedErrorId: 9601 zone missing, 9701 record
@@ -132,9 +150,11 @@ function script:Reset-DnsStubStore {
         CallLog        = @{}
         FailCode       = @{}
         BeforeCall     = @{}
-        ZoneScopes     = @{}
-        CimUnavailable = $false
-        NextId         = 0
+        ZoneScopes         = @{}
+        CimUnavailable     = $false
+        DeletesPtrWithHost = $true
+        ImplicitPtrDeletes = @()
+        NextId             = 0
     }
 
     $scavenging = New-Object -TypeName PSObject -Property ([ordered]@{
@@ -1326,6 +1346,109 @@ function script:Find-DnsStubRecord {
     }
 }
 
+function script:Remove-DnsStubImplicitPtr {
+    <#
+    .SYNOPSIS
+        Deletes the PTR records that a Windows Server 2025 DNS server deletes together with an A or AAAA record.
+
+    .DESCRIPTION
+        Measured on Windows Server 2025 on 2026-10-13 (CONTRACTS.md sections 7.5 and
+        13.9): removing an A or AAAA record by any path, or changing it with
+        Set-DnsServerResourceRecord or the WMI method Modify(IPAddress), makes the
+        server delete the PTR record of the record's address that points at the
+        record's name. Older servers leave that PTR alone.
+
+        With $script:DnsStub.DeletesPtrWithHost set (the default) this helper does
+        what the measured server does: in every primary reverse zone of the store,
+        a PTR whose owner is the reverse name of the record's address and whose
+        target equals the record's owner FQDN (compared without the trailing dot,
+        case-insensitive) is deleted. A PTR that points at another name stays, and
+        so does a PTR in a secondary zone. Each deleted PTR is appended to
+        $script:DnsStub.ImplicitPtrDeletes. With the switch off nothing happens.
+
+    .PARAMETER ZoneKey
+        The lower-case zone of the A or AAAA record.
+
+    .PARAMETER Record
+        The stored A or AAAA record, as it was before the change.
+
+    .EXAMPLE
+        Remove-DnsStubImplicitPtr -ZoneKey 'contoso.local' -Record $stored
+
+        Deletes 20.16.0.10.in-addr.arpa PTR srv01.contoso.local after the A record
+        srv01 -> 10.0.16.20 was removed.
+    #>
+    [CmdletBinding()]
+    [OutputType([void])]
+    param (
+        [Parameter(Mandatory)]
+        [string]$ZoneKey,
+
+        [Parameter(Mandatory)]
+        [object]$Record
+    )
+
+    if (-not $script:DnsStub.DeletesPtrWithHost) {
+        return
+    }
+    $recordType = ([string]$Record.RecordType).ToUpperInvariant()
+    if ($recordType -ne 'A' -and $recordType -ne 'AAAA') {
+        return
+    }
+
+    $zoneName = $script:DnsStub.Zones[$ZoneKey].ZoneName.ToLowerInvariant()
+    $hostOwner = $zoneName
+    if ($Record.HostName -ne '@') {
+        $hostOwner = ([string]$Record.HostName).ToLowerInvariant() + '.' + $zoneName
+    }
+
+    # The reverse name of the address, built by hand: the stub must not lean on the
+    # module code it stands in for.
+    $address = Get-DnsStubRecordValue -Record $Record
+    if ($recordType -eq 'A') {
+        $octets = $address.Split('.')
+        $reverseName = '{0}.{1}.{2}.{3}.in-addr.arpa' -f $octets[3], $octets[2], $octets[1], $octets[0]
+    }
+    else {
+        $bytes = ([ipaddress]$address).GetAddressBytes()
+        $nibbles = @(
+            for ($index = 15; $index -ge 0; $index--) {
+                '{0:x}' -f ($bytes[$index] -band 15)
+                '{0:x}' -f ($bytes[$index] -shr 4)
+            }
+        )
+        $reverseName = ($nibbles -join '.') + '.ip6.arpa'
+    }
+
+    foreach ($reverseKey in @($script:DnsStub.Zones.Keys)) {
+        $reverseZone = $script:DnsStub.Zones[$reverseKey]
+        if (-not $reverseZone.IsReverseLookupZone -or $reverseZone.ZoneType -ne 'Primary') {
+            continue
+        }
+        $deleted = @()
+        $kept = @(
+            foreach ($candidate in @($script:DnsStub.Records[$reverseKey])) {
+                if ($null -eq $candidate) {
+                    continue
+                }
+                $candidateOwner = $reverseKey
+                if ($candidate.HostName -ne '@') {
+                    $candidateOwner = ([string]$candidate.HostName).ToLowerInvariant() + '.' + $reverseKey
+                }
+                if ($candidate.RecordType -eq 'PTR' -and $candidateOwner -eq $reverseName -and (Get-DnsStubRecordValue -Record $candidate) -eq $hostOwner) {
+                    $deleted = @($deleted) + @('{0} -> {1}' -f $candidateOwner, $hostOwner)
+                    continue
+                }
+                $candidate
+            }
+        )
+        if ($deleted.Count -gt 0) {
+            $script:DnsStub.Records[$reverseKey] = $kept
+            $script:DnsStub.ImplicitPtrDeletes = @($script:DnsStub.ImplicitPtrDeletes) + $deleted
+        }
+    }
+}
+
 function script:Add-DnsStubLiveRecord {
     <#
     .SYNOPSIS
@@ -1902,6 +2025,8 @@ function script:Remove-DnsServerResourceRecord {
         records and WIN32 9714 when the node is gone (Test-DnsStubNode). Counts and
         logs every record, skips the change under -WhatIf, and fails when
         $script:DnsStub.Fail matches the zone (Win32 code from FailCode, default 5).
+        Removing an A or AAAA record also deletes the PTR that points at its name
+        while $script:DnsStub.DeletesPtrWithHost is set (Remove-DnsStubImplicitPtr).
 
     .PARAMETER ZoneName
         Zone name.
@@ -1996,6 +2121,7 @@ function script:Remove-DnsServerResourceRecord {
                 }
             }
         )
+        Remove-DnsStubImplicitPtr -ZoneKey $zoneKey -Record $stored
 
         if ($PassThru) {
             Copy-DnsStubRecord -Record $stored
@@ -2012,9 +2138,12 @@ function script:Set-DnsServerResourceRecord {
         Replaces the stored record that -OldInputObject stands for (by Id, and only
         while its data is unchanged) with a copy of -NewInputObject that keeps the
         stored Id and DistinguishedName. Everything else comes from
-        -NewInputObject, including Timestamp, so a test sees whatever the caller
-        carried through. Addresses set as strings are stored as [ipaddress] and
-        target names get their trailing dot, the shapes the other stubs use.
+        -NewInputObject, except Timestamp: the server makes every changed record
+        static, so the stored copy has none. Addresses set as strings are stored as
+        [ipaddress] and target names get their trailing dot, the shapes the other
+        stubs use. Changing an A or AAAA record, its TTL included, deletes the PTR
+        of its old address that points at its name while
+        $script:DnsStub.DeletesPtrWithHost is set (Remove-DnsStubImplicitPtr).
 
         Errors: 9601 zone missing; 9701 old record not there while its node still
         holds other records, 9714 when the node is gone (as for
@@ -2138,7 +2267,7 @@ function script:Set-DnsServerResourceRecord {
 
     # Add-Member -Force, not assignment: an object built by the caller may lack Id.
     $replacement = Copy-DnsStubRecord -Record $NewInputObject
-    $kept = @{ Id = $stored.Id; DistinguishedName = $stored.DistinguishedName; HostName = $stored.HostName; RecordType = $recordType }
+    $kept = @{ Id = $stored.Id; DistinguishedName = $stored.DistinguishedName; HostName = $stored.HostName; RecordType = $recordType; Timestamp = $null }
     foreach ($keptName in @($kept.Keys)) {
         Add-Member -InputObject $replacement -NotePropertyName $keptName -NotePropertyValue $kept[$keptName] -Force
     }
@@ -2164,6 +2293,7 @@ function script:Set-DnsServerResourceRecord {
             }
         }
     )
+    Remove-DnsStubImplicitPtr -ZoneKey $zoneKey -Record $stored
 
     if ($PassThru) {
         Copy-DnsStubRecord -Record $replacement
@@ -2669,12 +2799,16 @@ function script:Get-CimInstance {
             SELECT <properties> FROM MicrosoftDNS_<A|AAAA|CNAME|PTR|NS|MX|SRV>Type
                 [WHERE <property>='<value>' [AND <property>='<value>' ...]]
 
-        and answers from the stub store. Record objects carry ContainerName and
-        DomainName (the zone), OwnerName (the owner FQDN without a trailing dot, the
-        zone name at the apex), TTL, Timestamp, TextRepresentation and the
-        type-specific property with a trailing dot on names: PrimaryName (CNAME),
-        SRVDomainName (SRV), NSHost (NS), MailExchange (MX), PTRDomainName (PTR), or
-        IPAddress / IPv6Address. Conditions compare case-insensitively; WQL escapes
+        and answers from the stub store, for example
+        SELECT * FROM MicrosoftDNS_AType WHERE ContainerName='z' AND OwnerName='o'
+        AND IPAddress='v', the query of Set-DnsLiveRecord. Record objects carry
+        ContainerName and DomainName (the zone), OwnerName (the owner FQDN without a
+        trailing dot, the zone name at the apex), TTL, Timestamp, TextRepresentation
+        and the type-specific property with a trailing dot on names: PrimaryName
+        (CNAME), SRVDomainName (SRV), NSHost (NS), MailExchange (MX), PTRDomainName
+        (PTR), or IPAddress / IPv6Address, plus the stub-only StubZoneKey and
+        StubRecordId that lead Invoke-CimMethod back to the stored record (module
+        code must not read them). Conditions compare case-insensitively; WQL escapes
         (\' and \\) are understood. All properties are returned whatever the
         SELECT list says.
 
@@ -2815,6 +2949,8 @@ function script:Get-CimInstance {
                 TTL                = [int]$record.TimeToLive.TotalSeconds
                 Timestamp          = $timestampHours
                 TextRepresentation = '{0} IN {1} {2}' -f $owner, $classInfo['Type'], $value
+                StubZoneKey        = $zoneKey
+                StubRecordId       = $record.Id
             }
             $properties[$classInfo['Property']] = $value
             if ($classInfo['Type'] -eq 'MX') {
@@ -2843,6 +2979,142 @@ function script:Get-CimInstance {
             Add-Member -InputObject $instance -TypeName ('Microsoft.Management.Infrastructure.CimInstance#root/MicrosoftDNS/' + $class)
             $instance
         }
+    }
+}
+
+function script:Invoke-CimMethod {
+    <#
+    .SYNOPSIS
+        Stub for Invoke-CimMethod on a root\MicrosoftDNS record instance (method Modify).
+
+    .DESCRIPTION
+        Takes an instance from the Get-CimInstance stub and changes the stored record
+        it stands for (found through StubZoneKey and StubRecordId), the way the
+        MicrosoftDNS_<Type>.Modify method does on a server:
+
+          TTL                    TimeToLive = TTL seconds
+          IPAddress, IPv6Address the address of an A or AAAA record; also deletes the
+                                 PTR of the old address that points at the name while
+                                 $script:DnsStub.DeletesPtrWithHost is set (measured:
+                                 Modify(IPAddress) deletes it like the cmdlet,
+                                 Modify(TTL) does not)
+          PrimaryName            the target of a CNAME record
+          PTRDomainName          the target of a PTR record
+
+        Every change clears Timestamp (the record becomes static). Returns
+        @{ ReturnValue = $true }. Counts and logs every call, skips the change
+        under -WhatIf, and fails when $script:DnsStub.Fail['Invoke-CimMethod']
+        matches the instance's ContainerName (Win32 code from FailCode, default 5).
+        A method other than Modify writes an error; an instance whose record is
+        gone writes WBEM_E_NOT_FOUND (0x80041002).
+
+    .PARAMETER InputObject
+        The instance from Get-CimInstance.
+
+    .PARAMETER MethodName
+        Modify.
+
+    .PARAMETER Arguments
+        The method arguments, for example @{ TTL = [uint32]600 }.
+
+    .PARAMETER CimSession
+        Accepted and recorded.
+
+    .PARAMETER OperationTimeoutSec
+        Accepted and recorded.
+
+    .EXAMPLE
+        Invoke-CimMethod -InputObject $instance -MethodName Modify -Arguments @{ TTL = [uint32]600 } -WhatIf:$false -Confirm:$false
+
+        Sets the TTL of the stored record to 600 seconds.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([hashtable])]
+    param (
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string]$MethodName,
+
+        [Parameter()]
+        [System.Collections.IDictionary]$Arguments,
+
+        [Parameter()]
+        [object]$CimSession,
+
+        [Parameter()]
+        [uint32]$OperationTimeoutSec
+    )
+
+    process {
+        $command = 'Invoke-CimMethod'
+        $zoneKey = ''
+        if ($null -ne $InputObject.PSObject.Properties['StubZoneKey'] -and $InputObject.StubZoneKey) {
+            $zoneKey = [string]$InputObject.StubZoneKey
+        }
+        $shouldFail = Register-DnsStubCall -Command $command -ZoneName $zoneKey -BoundParameters $PSBoundParameters
+        if ($WhatIfPreference) {
+            Write-Verbose "What if: $command would run $MethodName on $($InputObject.OwnerName) (timeout $OperationTimeoutSec s)."
+            return
+        }
+        if ($shouldFail) {
+            $code = 5
+            if ($null -ne $script:DnsStub.FailCode[$command]) {
+                $code = [int]$script:DnsStub.FailCode[$command]
+            }
+            Write-Error -Message "Stub failure: $MethodName on $($InputObject.OwnerName) in zone $zoneKey failed." -Category (Get-DnsStubErrorCategory -Code $code) -ErrorId "WIN32 $code,$command" -TargetObject $InputObject
+            return
+        }
+        if ($MethodName -ne 'Modify') {
+            Write-Error -Message "Method '$MethodName' is not supported by the stub." -Category InvalidArgument -ErrorId 'HRESULT 0x8004102e,Microsoft.Management.Infrastructure.CimCmdlets.InvokeCimMethodCommand' -TargetObject $InputObject
+            return
+        }
+
+        $stored = $null
+        foreach ($candidate in @($script:DnsStub.Records[$zoneKey])) {
+            if ($null -ne $candidate -and $null -ne $InputObject.PSObject.Properties['StubRecordId'] -and $candidate.Id -eq $InputObject.StubRecordId) {
+                $stored = $candidate
+                break
+            }
+        }
+        if ($null -eq $stored) {
+            Write-Error -Message "Not found: $($InputObject.OwnerName) in zone $zoneKey." -Category ObjectNotFound -ErrorId 'HRESULT 0x80041002,Microsoft.Management.Infrastructure.CimCmdlets.InvokeCimMethodCommand' -TargetObject $InputObject
+            return
+        }
+
+        $methodArguments = @{}
+        if ($null -ne $Arguments) {
+            foreach ($key in @($Arguments.Keys)) {
+                $methodArguments[[string]$key] = $Arguments[$key]
+            }
+        }
+
+        $isAddressChange = ($stored.RecordType -eq 'A' -and $null -ne $methodArguments['IPAddress']) -or ($stored.RecordType -eq 'AAAA' -and $null -ne $methodArguments['IPv6Address'])
+        if ($isAddressChange) {
+            Remove-DnsStubImplicitPtr -ZoneKey $zoneKey -Record (Copy-DnsStubRecord -Record $stored)
+        }
+
+        if ($null -ne $methodArguments['TTL']) {
+            $stored.TimeToLive = New-TimeSpan -Seconds ([int]$methodArguments['TTL'])
+        }
+        $dataByType = @{ A = @('IPAddress', 'IPv4Address'); AAAA = @('IPv6Address', 'IPv6Address'); CNAME = @('PrimaryName', 'HostNameAlias'); PTR = @('PTRDomainName', 'PtrDomainName') }
+        $dataNames = $dataByType[[string]$stored.RecordType]
+        if ($null -ne $dataNames -and $null -ne $methodArguments[$dataNames[0]]) {
+            $newValue = [string]$methodArguments[$dataNames[0]]
+            if ($stored.RecordType -eq 'A' -or $stored.RecordType -eq 'AAAA') {
+                $stored.RecordData.($dataNames[1]) = [ipaddress]$newValue
+            }
+            else {
+                if (-not $newValue.EndsWith('.')) {
+                    $newValue = $newValue + '.'
+                }
+                $stored.RecordData.($dataNames[1]) = $newValue
+            }
+        }
+        $stored.Timestamp = $null
+
+        @{ ReturnValue = $true }
     }
 }
 

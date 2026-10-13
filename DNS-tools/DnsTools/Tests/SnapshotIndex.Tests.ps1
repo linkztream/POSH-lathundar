@@ -286,6 +286,56 @@ Describe 'New-DnsSnapshotIndex Names' {
     }
 }
 
+Describe 'New-DnsSnapshotIndex on owners written as escaped UTF-8 bytes' {
+    BeforeAll {
+        # Windows writes a non-ASCII character as one octal escape per UTF-8 byte; the
+        # first line is what a live Export-DnsServerZone wrote on 2026-10-13. The file
+        # is BOM-less UTF-8 with CRLF, like a real export.
+        $path = Join-Path $TestDrive 'escaped-utf8.txt'
+        $lines = @(
+            "r\303\244ksm\303\266rg\303\245s A`t10.251.0.12"
+            "euro\342\202\254`tA`t10.251.0.13"
+            "smile\360\237\230\200`tA`t10.251.0.14"
+            "latin\344`tA`t10.251.0.15"
+            "print\040room`tA`t10.251.0.16"
+            "alias`tCNAME`tr\303\244ksm\303\266rg\303\245s.contoso.local."
+        )
+        $encoding = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllBytes($path, $encoding.GetBytes(($lines -join "`r`n") + "`r`n"))
+
+        $parsed = ConvertFrom-DnsZoneFile -Path $path -ZoneName 'contoso.local'
+        $parsed['ExportedAt'] = $ExportedForward
+        $script:EscapedIndex = New-DnsSnapshotIndex -Server 'DC01' -ParseResult $parsed -ZoneTable $ZoneTable
+        $script:Raksmorgas = "r$([char]0xE4)ksm$([char]0xF6)rg$([char]0xE5)s.contoso.local"
+    }
+
+    # The expectations are built from code points, so they do not depend on how this
+    # file is decoded.
+    It 'indexes the owner written as <Escaped> under its decoded name' -TestCases @(
+        @{ Escaped = 'r\303\244ksm\303\266rg\303\245s'; Decoded = "r$([char]0xE4)ksm$([char]0xF6)rg$([char]0xE5)s"; Address = '10.251.0.12' }
+        @{ Escaped = 'euro\342\202\254'; Decoded = "euro$([char]0x20AC)"; Address = '10.251.0.13' }
+        @{ Escaped = 'smile\360\237\230\200'; Decoded = 'smile' + [char]::ConvertFromUtf32(0x1F600); Address = '10.251.0.14' }
+        # A byte that is not part of a well-formed UTF-8 sequence stays one character.
+        @{ Escaped = 'latin\344'; Decoded = "latin$([char]0xE4)"; Address = '10.251.0.15' }
+        @{ Escaped = 'print\040room'; Decoded = 'print room'; Address = '10.251.0.16' }
+    ) {
+        $fqdn = "$Decoded.contoso.local"
+        $EscapedIndex.Name[$fqdn] | Should -Be @("A`t$Address`t3600`t0`tcontoso.local")
+        $EscapedIndex.Addr[$Address] | Should -BeExactly @($fqdn)
+        @($EscapedIndex.Names | Where-Object { $_ -ceq $fqdn }).Count | Should -Be 1
+    }
+
+    It 'indexes a CNAME target written as escaped UTF-8 bytes under its decoded name' {
+        $EscapedIndex.RefBy[$Raksmorgas] | Should -Be @("CNAME`talias.contoso.local`tcontoso.local")
+        $EscapedIndex.Name['alias.contoso.local'] | Should -Be @("CNAME`t$Raksmorgas`t3600`t0`tcontoso.local")
+    }
+
+    It 'leaves no undecoded owner in the index' {
+        @($EscapedIndex.Names | Where-Object { $_.Contains('\') }).Count | Should -Be 0
+        $EscapedIndex.Names.Count | Should -Be 6
+    }
+}
+
 Describe 'New-DnsSnapshotIndex Zones and OldestExportedAt' {
     It 'stores ExportedAt, DefaultTtl, RecordCount and IsReverse per zone' {
         @($Index.Zones.Keys | Sort-Object) | Should -Be @('0/25.16.0.10.in-addr.arpa', '16.0.10.in-addr.arpa', '8.b.d.0.1.0.0.2.ip6.arpa', 'contoso.local')

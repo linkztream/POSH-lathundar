@@ -43,6 +43,12 @@
       8.b.d.0.1.0.0.2.ip6.arpa (primary)          PTR of 2001:db8::10 -> v6host
       fabrikam.com (secondary)                    web A 10.0.30.5
       partner.example (stub)
+
+    The stubs model the measured Windows Server 2025 by default: removing an A or
+    AAAA record deletes the PTR of its address that points at its name
+    ($script:DnsStub.DeletesPtrWithHost; $false models the older servers that keep
+    it). Remove-DnsEntry removes the PTR records first, so the switch matters for
+    -KeepPtr only; both settings are tested.
 #>
 
 BeforeAll {
@@ -367,13 +373,90 @@ Describe 'Remove-DnsEntry: names' {
         (Get-StubCallCount -Command 'New-CimSession') | Should -Be 0
     }
 
-    It 'keeps the aliases with -KeepAlias and the PTR records with -KeepPtr (no Result for them)' {
-        $results = @(Remove-DnsEntry -Identity 'srv01.contoso.local' -Server $script:Server -KeepAlias -KeepPtr -Force)
+    It 'keeps the aliases with -KeepAlias and the PTR records with -KeepPtr (no Result for them) on a server that keeps them' {
+        InModuleScope DnsTools { $script:DnsStub.DeletesPtrWithHost = $false }
+
+        $results = @(Remove-DnsEntry -Identity 'srv01.contoso.local' -Server $script:Server -KeepAlias -KeepPtr -Force -WarningVariable warnings -WarningAction SilentlyContinue)
 
         @($results | ForEach-Object { '{0} {1}' -f $_.Action, $_.Result }) | Should -Be @('RemoveA Success', 'RemoveA Success')
+        @($warnings).Count | Should -Be 0
         @(Get-StubNode -Zone 'contoso.local' -Node 'gw') | Should -Be @('CNAME srv01.contoso.local')
         @(Get-StubNode -Zone 'lab.contoso.local' -Node 'alias01') | Should -Be @('CNAME srv01.contoso.local')
         @(Get-StubNode -Zone '16.0.10.in-addr.arpa' -Node '20') | Should -Be @('PTR srv01.contoso.local')
+        @(Get-StubNode -Zone '16.0.10.in-addr.arpa' -Node '21') | Should -Be @('PTR srv01.contoso.local')
+        (Get-StubCallCount -Command 'Remove-DnsServerResourceRecord') | Should -Be 2
+    }
+
+    It 'reports a PTR record that the server deleted despite -KeepPtr as RemovePtr Success with the contract text, and warns once per run' {
+        $logPath = Join-Path -Path $script:Root -ChildPath 'log\keepptr.jsonl'
+
+        $results = @('srv01.contoso.local', 'web.contoso.local' | Remove-DnsEntry -Server $script:Server -KeepAlias -KeepPtr -Force -LogPath $logPath -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        @($results | ForEach-Object { '{0} {1} {2}' -f $_.Action, $_.Name, $_.Result }) | Should -Be @(
+            'RemoveA srv01.contoso.local Success'
+            'RemovePtr 20.16.0.10.in-addr.arpa Success'
+            'RemoveA srv01.contoso.local Success'
+            'RemovePtr 21.16.0.10.in-addr.arpa Success'
+            'RemoveA web.contoso.local Success'
+            'RemovePtr 40.16.0.10.in-addr.arpa Success'
+        )
+        $keepPtrText = 'Removed by the DNS server together with the A record; -KeepPtr cannot be honoured on this server.'
+        foreach ($result in @($results | Where-Object { $_.Action -eq 'RemovePtr' })) {
+            $result.Error | Should -BeExactly $keepPtrText
+            $result.Type | Should -BeExactly 'PTR'
+            $result.Zone | Should -BeExactly '16.0.10.in-addr.arpa'
+        }
+        $results[1].Data | Should -BeExactly 'srv01.contoso.local'
+        $results[1].NodeName | Should -BeExactly '20'
+        @($warnings | Where-Object { [string]$_ -eq $keepPtrText }).Count | Should -Be 1
+        @($warnings).Count | Should -Be 1
+
+        # Only the A records were removed by the command; the server deleted the PTRs.
+        @(Get-StubNode -Zone '16.0.10.in-addr.arpa' -Node '20').Count | Should -Be 0
+        (Get-StubCallCount -Command 'Remove-DnsServerResourceRecord') | Should -Be 3
+        InModuleScope DnsTools { @($script:DnsStub.ImplicitPtrDeletes).Count } | Should -Be 3
+
+        # Before comes from the read before the removal.
+        $line = @(Get-LogLine -Path $logPath | Where-Object { $_.Action -eq 'RemovePtr' })[0]
+        $line.Result | Should -BeExactly 'Success'
+        $line.Error | Should -BeExactly $keepPtrText
+        $line.Before.Data | Should -BeExactly 'srv01.contoso.local'
+        $line.Before.Ttl | Should -Be 3600
+    }
+
+    It 'with -KeepPtr leaves a PTR in a read-only reverse zone without a Result' {
+        $results = @(Remove-DnsEntry -Identity 'ro01.contoso.local' -Server $script:Server -KeepPtr -Force -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        @($results | ForEach-Object { '{0} {1}' -f $_.Action, $_.Result }) | Should -Be @('RemoveA Success')
+        @($warnings).Count | Should -Be 0
+        @(Get-StubNode -Zone '18.0.10.in-addr.arpa' -Node '5') | Should -Be @('PTR ro01.contoso.local')
+    }
+
+    It 'removes every PTR record once, before the A record, on both kinds of server (DeletesPtrWithHost <Deletes>)' -TestCases @(
+        @{ Deletes = $true }
+        @{ Deletes = $false }
+    ) {
+        InModuleScope DnsTools -Parameters @{ Deletes = $Deletes } {
+            param ($Deletes)
+            $script:DnsStub.DeletesPtrWithHost = $Deletes
+            # A second PTR of 10.0.16.20, in the shadowed /16, points at srv01 too.
+            Add-DnsStubRecord -ZoneName '0.10.in-addr.arpa' -Name '20.16' -RRType PTR -Data 'srv01.contoso.local'
+        }
+
+        $results = @(Remove-DnsEntry -Identity 'srv01.contoso.local' -Server $script:Server -KeepAlias -Force -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        @($results | ForEach-Object { '{0} {1} {2}' -f $_.Action, $_.Zone, $_.Result }) | Should -Be @(
+            'RemovePtr 16.0.10.in-addr.arpa Success'
+            'RemovePtr 0.10.in-addr.arpa Success'
+            'RemovePtr 16.0.10.in-addr.arpa Success'
+            'RemoveA contoso.local Success'
+            'RemoveA contoso.local Success'
+        )
+        @($results | Where-Object { $_.Error }).Count | Should -Be 0
+        @($warnings).Count | Should -Be 0
+        InModuleScope DnsTools { @(@($script:DnsStub.CallLog['Remove-DnsServerResourceRecord']) | Where-Object { $_['InputObject'].RecordType -eq 'PTR' }).Count } | Should -Be 3
+        InModuleScope DnsTools { @($script:DnsStub.ImplicitPtrDeletes).Count } | Should -Be 0
+        @(Get-StubNode -Zone '0.10.in-addr.arpa' -Node '20.16').Count | Should -Be 0
     }
 
     It 'removes the DHCID record after the last A record, warns per dynamic record and counts them in the summary' {

@@ -388,6 +388,46 @@ Describe 'ConvertFrom-DnsZoneFile grammar edge cases' {
         $result.Rows[0].Split("`t")[0] | Should -BeExactly 'host.site b.contoso.local'
     }
 
+    It 'decodes a run of escapes as UTF-8 bytes, the way Windows writes non-ASCII names' {
+        # The first line is what a live Export-DnsServerZone wrote for the host
+        # 'räksmörgås' (2026-10-13): one octal escape per UTF-8 byte, so \303\244 is
+        # C3 A4, the letter U+00E4, and not the two characters U+00C3 U+00A4.
+        $path = New-ZoneFile 'escape-utf8.txt' @(
+            "r\303\244ksm\303\266rg\303\245s A`t10.251.0.12"
+            "\303\205sa`tA`t10.0.0.2"
+            "euro\342\202\254`tA`t10.0.0.3"
+            "smile\360\237\230\200`tA`t10.0.0.4"
+            "latin\344`tA`t10.0.0.5"
+            "space\040here`tA`t10.0.0.6"
+        )
+        $result = ConvertFrom-DnsZoneFile -Path $path -ZoneName 'contoso.local'
+        $owners = @($result.Rows | ForEach-Object { $_.Split("`t")[0] })
+
+        $owners[0] | Should -BeExactly "r$([char]0xE4)ksm$([char]0xF6)rg$([char]0xE5)s.contoso.local"
+        # An escaped upper-case letter is decoded first and lower-cased after.
+        $owners[1] | Should -BeExactly "$([char]0xE5)sa.contoso.local"
+        $owners[2] | Should -BeExactly "euro$([char]0x20AC).contoso.local"
+        # Beyond U+FFFF: a surrogate pair.
+        $owners[3] | Should -BeExactly ('smile' + [char]::ConvertFromUtf32(0x1F600) + '.contoso.local')
+        # A byte that is not part of a well-formed sequence (a Latin-1 export) stays
+        # one character, and the line is not skipped.
+        $owners[4] | Should -BeExactly "latin$([char]0xE4).contoso.local"
+        $owners[5] | Should -BeExactly 'space here.contoso.local'
+        $result.RecordCount | Should -Be 6
+        $result.SkippedLines | Should -Be 0
+    }
+
+    It 'decodes escaped UTF-8 bytes in targets and in $ORIGIN as well' {
+        $path = New-ZoneFile 'escape-utf8-target.txt' @(
+            '$ORIGIN k\303\266k.contoso.local.'
+            "alias`tCNAME`tr\303\244ksm\303\266rg\303\245s.contoso.local."
+        )
+        $result = ConvertFrom-DnsZoneFile -Path $path -ZoneName 'contoso.local'
+        $fields = $result.Rows[0].Split("`t")
+        $fields[0] | Should -BeExactly "alias.k$([char]0xF6)k.contoso.local"
+        $fields[2] | Should -BeExactly "r$([char]0xE4)ksm$([char]0xF6)rg$([char]0xE5)s.contoso.local"
+    }
+
     It 'skips the body of a multi-line record of an ignored type' {
         $path = New-ZoneFile 'dnskey.txt' @(
             "@`tDNSKEY`t257 3 8 ("

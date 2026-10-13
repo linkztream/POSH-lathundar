@@ -330,6 +330,29 @@ Describe 'ConvertTo-DnsNormalizedName' {
         }
     }
 
+    # Windows writes a non-ASCII character as one octal escape per UTF-8 byte
+    # (verified on a live export 2026-10-13). The expectations are built from code
+    # points, so they do not depend on how this file is decoded.
+    It 'decodes the escaped UTF-8 bytes in <Name>' -TestCases @(
+        @{ Name = 'r\303\244ksm\303\266rg\303\245s.contoso.local.'; Expected = "r$([char]0xE4)ksm$([char]0xF6)rg$([char]0xE5)s.contoso.local" }
+        @{ Name = 'R\303\204KSM\303\226RG\303\205S'; Expected = "r$([char]0xE4)ksm$([char]0xF6)rg$([char]0xE5)s" }
+        @{ Name = 'euro\342\202\254'; Expected = "euro$([char]0x20AC)" }
+        @{ Name = 'smile\360\237\230\200'; Expected = 'smile' + [char]::ConvertFromUtf32(0x1F600) }
+        @{ Name = 'room\040\303\245'; Expected = "room $([char]0xE5)" }
+        # Bytes outside a well-formed sequence are one character each: a lone byte
+        # (a Latin-1 export), a lead byte before a valid sequence, a truncated
+        # sequence and an encoded surrogate (not allowed in UTF-8).
+        @{ Name = 'latin\344'; Expected = "latin$([char]0xE4)" }
+        @{ Name = '\344\303\244'; Expected = "$([char]0xE4)$([char]0xE4)" }
+        @{ Name = 'cut\342\202'; Expected = "cut$([char]0xE2)$([char]0x82)" }
+        @{ Name = 'half\355\240\200'; Expected = "half$([char]0xED)$([char]0xA0)$([char]0x80)" }
+    ) {
+        InModuleScope DnsTools -Parameters @{ Name = $Name; Expected = $Expected } {
+            param ($Name, $Expected)
+            ConvertTo-DnsNormalizedName -Name $Name | Should -BeExactly $Expected
+        }
+    }
+
     It 'accepts $null and returns an empty string' {
         InModuleScope DnsTools {
             ConvertTo-DnsNormalizedName -Name $null | Should -BeExactly ''

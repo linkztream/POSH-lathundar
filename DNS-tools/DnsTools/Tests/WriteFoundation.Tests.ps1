@@ -883,13 +883,22 @@ Describe 'Set-DnsLiveRecord' {
         Initialize-WriteTest -Root $script:Root
     }
 
-    It 'changes the TTL of one record and leaves the other record at the node alone' {
+    It 'changes a TTL through WMI Modify and leaves the other record at the node and the PTR record alone' {
         $probe = InModuleScope DnsTools -Parameters @{ Server = $script:Server } {
             param ($Server)
             $serverParameter = @{ ComputerName = $Server }
-            $outcome = Set-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'srv01' -RRType A -Data '10.0.16.20' -NewTtl 600
+            $session = Get-DnsCimSession -Server $Server
+            $queriesBefore = @($script:DnsStub.CallLog['Get-CimInstance']).Count
+            $outcome = Set-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'srv01' -RRType A -Data '10.0.16.20' -NewTtl 600 -CimSession $session
             $records = @(Get-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'srv01' -RRType A)
-            @{ Outcome = $outcome; Ttls = @($records | ForEach-Object { '{0}={1}' -f $_['Data'], $_['Ttl'] }) }
+            @{
+                Outcome  = $outcome
+                Ttls     = @($records | ForEach-Object { '{0}={1}' -f $_['Data'], $_['Ttl'] })
+                Ptr      = @(Get-DnsLiveRecord -ServerParameter $serverParameter -ZoneName '16.0.10.in-addr.arpa' -NodeName '20' -RRType PTR | ForEach-Object { $_['Data'] })
+                Queries  = @(@($script:DnsStub.CallLog['Get-CimInstance']) | Select-Object -Skip $queriesBefore)
+                Modify   = @($script:DnsStub.CallLog['Invoke-CimMethod'])
+                SetCalls = [int]$script:DnsStub.Calls['Set-DnsServerResourceRecord']
+            }
         }
 
         (@($probe['Outcome'].Keys) | Sort-Object) -join ',' | Should -BeExactly 'Error,ErrorId,Record,Unreachable'
@@ -900,6 +909,121 @@ Describe 'Set-DnsLiveRecord' {
         $probe['Outcome']['Record']['Data'] | Should -BeExactly '10.0.16.20'
         $probe['Outcome']['Record']['Ttl'] | Should -Be 600
         $probe['Ttls'] -join ',' | Should -BeExactly '10.0.16.20=600,10.0.16.21=3600'
+        $probe['Ptr'] | Should -Be @('srv01.contoso.local')
+
+        # srv01 has two A records, so the data condition selects the one.
+        $probe['Queries'].Count | Should -Be 1
+        $probe['Queries'][0]['Namespace'] | Should -BeExactly 'root\MicrosoftDNS'
+        $probe['Queries'][0]['Query'] | Should -BeExactly "SELECT * FROM MicrosoftDNS_AType WHERE ContainerName='contoso.local' AND OwnerName='srv01.contoso.local' AND IPAddress='10.0.16.20'"
+        $probe['Modify'].Count | Should -Be 1
+        $probe['Modify'][0]['MethodName'] | Should -BeExactly 'Modify'
+        @($probe['Modify'][0]['Arguments'].Keys) | Should -Be @('TTL')
+        $probe['Modify'][0]['Arguments']['TTL'] | Should -BeOfType [uint32]
+        $probe['Modify'][0]['Arguments']['TTL'] | Should -Be 600
+        [bool]$probe['Modify'][0]['WhatIf'] | Should -BeFalse
+        $probe['Modify'][0].Keys | Should -Contain 'Confirm'
+        $probe['SetCalls'] | Should -Be 0
+    }
+
+    It 'selects the only <RRType> record of a node by zone and owner, without a data condition' -TestCases @(
+        @{ RRType = 'A'; Zone = 'contoso.local'; Node = 'mail'; Data = '10.0.16.50'; Query = "SELECT * FROM MicrosoftDNS_AType WHERE ContainerName='contoso.local' AND OwnerName='mail.contoso.local'" }
+        @{ RRType = 'CNAME'; Zone = 'contoso.local'; Node = 'gw'; Data = 'srv01.contoso.local'; Query = "SELECT * FROM MicrosoftDNS_CNAMEType WHERE ContainerName='contoso.local' AND OwnerName='gw.contoso.local'" }
+        @{ RRType = 'PTR'; Zone = '16.0.10.in-addr.arpa'; Node = '20'; Data = 'srv01.contoso.local'; Query = "SELECT * FROM MicrosoftDNS_PTRType WHERE ContainerName='16.0.10.in-addr.arpa' AND OwnerName='20.16.0.10.in-addr.arpa'" }
+    ) {
+        $probe = InModuleScope DnsTools -Parameters @{ Server = $script:Server; RRType = $RRType; Zone = $Zone; Node = $Node; Data = $Data } {
+            param ($Server, $RRType, $Zone, $Node, $Data)
+            $session = Get-DnsCimSession -Server $Server
+            $outcome = Set-DnsLiveRecord -ServerParameter @{ ComputerName = $Server } -ZoneName $Zone -NodeName $Node -RRType $RRType -Data $Data -NewTtl 120 -CimSession $session
+            @{ Outcome = $outcome; Query = @($script:DnsStub.CallLog['Get-CimInstance'])[-1]['Query']; Modify = [int]$script:DnsStub.Calls['Invoke-CimMethod'] }
+        }
+
+        $probe['Outcome']['Error'] | Should -BeNullOrEmpty
+        $probe['Outcome']['Record']['Ttl'] | Should -Be 120
+        $probe['Query'] | Should -BeExactly $Query
+        $probe['Modify'] | Should -Be 1
+    }
+
+    It 'returns WmiUnavailable with the contract text and changes nothing without a CIM session' {
+        $probe = InModuleScope DnsTools -Parameters @{ Server = $script:Server } {
+            param ($Server)
+            $serverParameter = @{ ComputerName = $Server }
+            $outcome = Set-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'srv01' -RRType A -Data '10.0.16.20' -NewTtl 600 -CimSession $null
+            @{
+                Outcome = $outcome
+                Ttl     = @(Get-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'srv01' -RRType A)[0]['Ttl']
+                Calls   = '{0},{1},{2}' -f [int]$script:DnsStub.Calls['Get-CimInstance'], [int]$script:DnsStub.Calls['Invoke-CimMethod'], [int]$script:DnsStub.Calls['Set-DnsServerResourceRecord']
+            }
+        }
+
+        $probe['Outcome']['Error'] | Should -BeExactly "TTL changes go through WMI (root\MicrosoftDNS) because Set-DnsServerResourceRecord deletes the record's PTR; no WMI session to '$($script:Server)' could be opened."
+        $probe['Outcome']['ErrorId'] | Should -BeExactly 'DnsTools.Set-DnsLiveRecord.WmiUnavailable'
+        $probe['Outcome']['Unreachable'] | Should -BeFalse
+        $probe['Outcome']['Record'] | Should -BeNullOrEmpty
+        $probe['Ttl'] | Should -Be 3600
+        $probe['Calls'] | Should -BeExactly '0,0,0'
+    }
+
+    It 'returns WmiUnavailable and changes nothing when <Case>' -TestCases @(
+        @{ Case = 'the provider refuses the query'; Stub = 'Get-CimInstance'; Pattern = 'contoso.local' }
+        @{ Case = 'the provider refuses Modify (access denied)'; Stub = 'Invoke-CimMethod'; Pattern = '*' }
+    ) {
+        $probe = InModuleScope DnsTools -Parameters @{ Server = $script:Server; Stub = $Stub; Pattern = $Pattern } {
+            param ($Server, $Stub, $Pattern)
+            $serverParameter = @{ ComputerName = $Server }
+            $session = Get-DnsCimSession -Server $Server
+            $script:DnsStub.Fail[$Stub] = @($Pattern)
+            $outcome = Set-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'mail' -RRType A -Data '10.0.16.50' -NewTtl 600 -CimSession $session
+            @{
+                Outcome  = $outcome
+                Ttl      = @(Get-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'mail' -RRType A)[0]['Ttl']
+                SetCalls = [int]$script:DnsStub.Calls['Set-DnsServerResourceRecord']
+            }
+        }
+
+        $probe['Outcome']['ErrorId'] | Should -BeExactly 'DnsTools.Set-DnsLiveRecord.WmiUnavailable'
+        $probe['Outcome']['Error'] | Should -BeLike '*root\MicrosoftDNS*Stub failure*'
+        $probe['Outcome']['Unreachable'] | Should -BeFalse
+        $probe['Outcome']['Record'] | Should -BeNullOrEmpty
+        $probe['Ttl'] | Should -Be 3600
+        $probe['SetCalls'] | Should -Be 0
+    }
+
+    It 'reports an unreachable server, not WmiUnavailable, when Modify fails with WIN32 1722' {
+        $outcome = InModuleScope DnsTools -Parameters @{ Server = $script:Server } {
+            param ($Server)
+            $session = Get-DnsCimSession -Server $Server
+            $script:DnsStub.Fail['Invoke-CimMethod'] = @('*')
+            $script:DnsStub.FailCode['Invoke-CimMethod'] = 1722
+            Set-DnsLiveRecord -ServerParameter @{ ComputerName = $Server } -ZoneName 'contoso.local' -NodeName 'mail' -RRType A -Data '10.0.16.50' -NewTtl 600 -CimSession $session
+        }
+
+        $outcome['Unreachable'] | Should -BeTrue
+        $outcome['ErrorId'] | Should -BeLike 'WIN32 1722,*'
+        $outcome['Record'] | Should -BeNullOrEmpty
+    }
+
+    It 'changes the TTL with Set-DnsServerResourceRecord under -UseDnsServerCmdlet; the PTR survives only where the server keeps it (DeletesPtrWithHost <Deletes>)' -TestCases @(
+        @{ Deletes = $true; Ptrs = 0 }
+        @{ Deletes = $false; Ptrs = 1 }
+    ) {
+        $probe = InModuleScope DnsTools -Parameters @{ Server = $script:Server; Deletes = $Deletes } {
+            param ($Server, $Deletes)
+            $script:DnsStub.DeletesPtrWithHost = $Deletes
+            $serverParameter = @{ ComputerName = $Server }
+            $outcome = Set-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'srv01' -RRType A -Data '10.0.16.20' -NewTtl 600 -UseDnsServerCmdlet
+            @{
+                Outcome = $outcome
+                Ptrs    = @(Get-DnsLiveRecord -ServerParameter $serverParameter -ZoneName '16.0.10.in-addr.arpa' -NodeName '20' -RRType PTR).Count
+                Calls   = '{0},{1},{2}' -f [int]$script:DnsStub.Calls['Get-CimInstance'], [int]$script:DnsStub.Calls['Invoke-CimMethod'], [int]$script:DnsStub.Calls['Set-DnsServerResourceRecord']
+                Log     = @($script:DnsStub.CallLog['Set-DnsServerResourceRecord'])
+            }
+        }
+
+        $probe['Outcome']['Error'] | Should -BeNullOrEmpty
+        $probe['Outcome']['Record']['Ttl'] | Should -Be 600
+        $probe['Ptrs'] | Should -Be $Ptrs
+        $probe['Calls'] | Should -BeExactly '0,0,1'
+        $probe['Log'][0]['NewInputObject'].TimeToLive | Should -Be (New-TimeSpan -Seconds 600)
     }
 
     It 'fetches the record twice and writes the new data as a string on the second copy (<RRType>)' -TestCases @(
@@ -921,8 +1045,9 @@ Describe 'Set-DnsLiveRecord' {
         $probe['Outcome']['Record']['Data'] | Should -BeExactly $Expected
         $probe['Data'] | Should -Contain $Expected
         $probe['Data'] | Should -Not -Contain $Data
-        # Two reads before the change, one read-back after it.
+        # Two reads before the change, one read-back after it; no WMI for data.
         $probe['Reads'] | Should -Be 3
+        InModuleScope DnsTools { '{0},{1}' -f [int]$script:DnsStub.Calls['Get-CimInstance'], [int]$script:DnsStub.Calls['Invoke-CimMethod'] } | Should -BeExactly '0,0'
 
         $probe['Log'].Count | Should -Be 1
         $call = $probe['Log'][0]
@@ -935,17 +1060,25 @@ Describe 'Set-DnsLiveRecord' {
         $call.Keys | Should -Contain 'Confirm'
     }
 
-    It 'returns the re-read record with the timestamp the server kept' {
-        $probe = InModuleScope DnsTools -Parameters @{ Server = $script:Server } {
-            param ($Server)
+    It 'returns the re-read record, which the change made static (<Path>)' -TestCases @(
+        @{ Path = 'WMI' }
+        @{ Path = 'DnsServer cmdlet' }
+    ) {
+        $probe = InModuleScope DnsTools -Parameters @{ Server = $script:Server; Path = $Path } {
+            param ($Server, $Path)
             $serverParameter = @{ ComputerName = $Server }
             $before = @(Get-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'dyn01' -RRType A)[0]
-            $outcome = Set-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'dyn01' -RRType A -Data '10.0.16.30' -NewTtl 1200
+            $pathParameters = @{ CimSession = (Get-DnsCimSession -Server $Server) }
+            if ($Path -ne 'WMI') {
+                $pathParameters = @{ UseDnsServerCmdlet = $true }
+            }
+            $outcome = Set-DnsLiveRecord -ServerParameter $serverParameter -ZoneName 'contoso.local' -NodeName 'dyn01' -RRType A -Data '10.0.16.30' -NewTtl 1200 @pathParameters
             @{ Before = $before; Outcome = $outcome }
         }
 
         $probe['Before']['Timestamp'] | Should -BeOfType [datetime]
-        $probe['Outcome']['Record']['Timestamp'] | Should -Be $probe['Before']['Timestamp']
+        $probe['Outcome']['Error'] | Should -BeNullOrEmpty
+        $probe['Outcome']['Record']['Timestamp'] | Should -BeNullOrEmpty
         $probe['Outcome']['Record']['Ttl'] | Should -Be 1200
     }
 
@@ -1010,8 +1143,10 @@ Describe 'Live write helpers on a failing server' {
                     RRType          = $Target['RRType']
                     Data            = $Target['Data']
                 }
+                # The DnsServer cmdlet path; the WMI path has its own tests above.
                 if ($Helper -eq 'Set-DnsLiveRecord') {
                     $arguments['NewTtl'] = 600
+                    $arguments['UseDnsServerCmdlet'] = $true
                 }
                 & $Helper @arguments
             }
@@ -1109,22 +1244,23 @@ Describe 'Write helpers ignore the caller''s -WhatIf' {
 
             function Invoke-WriteProbe {
                 [CmdletBinding(SupportsShouldProcess)]
-                param ([hashtable]$ServerParameter)
+                param ([hashtable]$ServerParameter, [object]$CimSession)
 
                 @{
                     Add    = Add-DnsLiveRecord -ServerParameter $ServerParameter -ZoneName 'contoso.local' -NodeName 'probe01' -RRType A -Data '10.0.16.61'
-                    Set    = Set-DnsLiveRecord -ServerParameter $ServerParameter -ZoneName 'contoso.local' -NodeName 'srv01' -RRType A -Data '10.0.16.20' -NewTtl 900
+                    Set    = Set-DnsLiveRecord -ServerParameter $ServerParameter -ZoneName 'contoso.local' -NodeName 'srv01' -RRType A -Data '10.0.16.20' -NewTtl 900 -CimSession $CimSession
                     Remove = Remove-DnsLiveRecord -ServerParameter $ServerParameter -ZoneName 'contoso.local' -NodeName 'srv01' -RRType A -Data '10.0.16.21'
                 }
             }
 
             $serverParameter = @{ ComputerName = $Server }
+            $session = Get-DnsCimSession -Server $Server
             if ($ThroughProbe) {
-                $outcomes = Invoke-WriteProbe -ServerParameter $serverParameter -WhatIf
+                $outcomes = Invoke-WriteProbe -ServerParameter $serverParameter -CimSession $session -WhatIf
             }
             else {
                 $WhatIfPreference = $true
-                $outcomes = Invoke-WriteProbe -ServerParameter $serverParameter
+                $outcomes = Invoke-WriteProbe -ServerParameter $serverParameter -CimSession $session
                 $WhatIfPreference = $false
             }
 
@@ -1464,6 +1600,70 @@ Describe 'Phase-2 stubs' {
         $probe['First'].Id | Should -BeExactly $probe['Second'].Id
         $probe['First'].RecordData.IPv4Address.IPAddressToString | Should -BeExactly '10.0.16.20'
         $probe['Third'].RecordData.IPv4Address.IPAddressToString | Should -BeExactly '10.0.16.20'
+    }
+
+    It 'delete the PTR of the address that points at the name with an A record, in every primary reverse zone, when DeletesPtrWithHost is <Deletes>' -TestCases @(
+        @{ Deletes = $true; Left = 'PTR 10 dc01.contoso.local|PTR 20 other.contoso.local|PTR 21 srv01.contoso.local|PTR 20.16 other.contoso.local' }
+        @{ Deletes = $false; Left = 'PTR 10 dc01.contoso.local|PTR 20 srv01.contoso.local|PTR 20 other.contoso.local|PTR 21 srv01.contoso.local|PTR 20.16 srv01.contoso.local|PTR 20.16 other.contoso.local' }
+    ) {
+        $probe = InModuleScope DnsTools -Parameters @{ Deletes = $Deletes } {
+            param ($Deletes)
+            $script:DnsStub.DeletesPtrWithHost = $Deletes
+            Add-DnsStubZone -Name '0.10.in-addr.arpa'
+            Add-DnsStubRecord -ZoneName '16.0.10.in-addr.arpa' -Name '20' -RRType PTR -Data 'other.contoso.local'
+            Add-DnsStubRecord -ZoneName '16.0.10.in-addr.arpa' -Name '21' -RRType PTR -Data 'srv01.contoso.local'
+            Add-DnsStubRecord -ZoneName '0.10.in-addr.arpa' -Name '20.16' -RRType PTR -Data 'SRV01.contoso.local.'
+            Add-DnsStubRecord -ZoneName '0.10.in-addr.arpa' -Name '20.16' -RRType PTR -Data 'other.contoso.local'
+
+            $record = @(Get-DnsServerResourceRecord -ZoneName 'contoso.local' -Name 'srv01' -Node -RRType A | Where-Object { $_.RecordData.IPv4Address.IPAddressToString -eq '10.0.16.20' })[0]
+            $record | Remove-DnsServerResourceRecord -ZoneName 'contoso.local' -Force -WhatIf:$false -Confirm:$false
+            @{
+                Left    = @(
+                    foreach ($zoneKey in @('16.0.10.in-addr.arpa', '0.10.in-addr.arpa')) {
+                        foreach ($stored in @($script:DnsStub.Records[$zoneKey])) {
+                            'PTR {0} {1}' -f $stored.HostName, (Get-DnsStubRecordValue -Record $stored)
+                        }
+                    }
+                ) -join '|'
+                Deleted = @($script:DnsStub.ImplicitPtrDeletes)
+            }
+        }
+
+        $probe['Left'] | Should -BeExactly $Left
+        if ($Deletes) {
+            $probe['Deleted'] | Should -Be @('20.16.0.10.in-addr.arpa -> srv01.contoso.local', '20.16.0.10.in-addr.arpa -> srv01.contoso.local')
+        }
+        else {
+            $probe['Deleted'].Count | Should -Be 0
+        }
+    }
+
+    It 'answer the Set-DnsLiveRecord WQL query and change the TTL with Invoke-CimMethod Modify' {
+        $probe = InModuleScope DnsTools {
+            $instances = @(Get-CimInstance -Namespace 'root\MicrosoftDNS' -Query "SELECT * FROM MicrosoftDNS_AType WHERE ContainerName='contoso.local' AND OwnerName='SRV01.contoso.local' AND IPAddress='10.0.16.21'")
+            $answer = Invoke-CimMethod -InputObject $instances[0] -MethodName Modify -Arguments @{ TTL = [uint32]120 } -WhatIf:$false -Confirm:$false
+            $dynamic = @(Get-CimInstance -Namespace 'root\MicrosoftDNS' -Query "SELECT * FROM MicrosoftDNS_AType WHERE ContainerName='contoso.local' AND OwnerName='dyn01.contoso.local'")
+            $null = Invoke-CimMethod -InputObject $dynamic[0] -MethodName Modify -Arguments @{ TTL = [uint32]60 } -WhatIf:$false -Confirm:$false
+            @{
+                Count    = $instances.Count
+                Instance = $instances[0]
+                Answer   = $answer
+                Stored   = @($script:DnsStub.Records['contoso.local'] | Where-Object { $_.Id -eq $instances[0].StubRecordId })[0]
+                Dynamic  = @($script:DnsStub.Records['contoso.local'] | Where-Object { $_.HostName -eq 'dyn01' })[0]
+                Calls    = [int]$script:DnsStub.Calls['Invoke-CimMethod']
+            }
+        }
+
+        $probe['Count'] | Should -Be 1
+        $probe['Instance'].OwnerName | Should -BeExactly 'srv01.contoso.local'
+        $probe['Instance'].ContainerName | Should -BeExactly 'contoso.local'
+        $probe['Instance'].IPAddress | Should -BeExactly '10.0.16.21'
+        $probe['Instance'].TTL | Should -Be 3600
+        $probe['Answer']['ReturnValue'] | Should -BeTrue
+        $probe['Stored'].TimeToLive | Should -Be (New-TimeSpan -Seconds 120)
+        $probe['Dynamic'].TimeToLive | Should -Be (New-TimeSpan -Seconds 60)
+        $probe['Dynamic'].Timestamp | Should -BeNullOrEmpty
+        $probe['Calls'] | Should -Be 2
     }
 
     It 'answer Get-DnsServerZoneScope, Set-DnsServerZoneAging and skip writes under -WhatIf' {

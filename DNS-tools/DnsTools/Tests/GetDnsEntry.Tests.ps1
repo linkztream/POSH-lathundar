@@ -710,6 +710,30 @@ Describe 'Get-DnsEntry snapshot handling' {
         Get-ExportCallCount | Should -Be $exportCalls
     }
 
+    It 'finds a non-ASCII owner that the export wrote as escaped UTF-8 bytes' {
+        # Export-DnsServerZone writes 'Räksmörgås' as R\303\244ksm\303\266rg\303\245s,
+        # one octal escape per UTF-8 byte (verified on a live server 2026-10-13). The
+        # stub writes names as they are, so the snapshot file is rewritten here the
+        # way Windows writes it, and the index is built again from that file.
+        New-EntrySnapshot
+        InModuleScope DnsTools -Parameters @{ Server = $script:Server } {
+            param ($Server)
+            $meta = Get-DnsSnapshotMeta -Server $Server
+            $zonePath = Join-Path -Path (Get-DnsSnapshotRoot -Server $Server) -ChildPath ([string]$meta['Zones']['contoso.local']['File'])
+            $text = Get-Content -LiteralPath $zonePath -Raw -Encoding UTF8
+            $text.Contains('Räksmörgås') | Should -BeTrue
+            Set-Content -LiteralPath $zonePath -Value $text.Replace('Räksmörgås', 'R\303\244ksm\303\266rg\303\245s') -Encoding UTF8 -NoNewline
+            $script:SnapshotIndexCache = @{}
+        }
+
+        $entries = @(Get-DnsEntry -Find 'räk*' -Server $script:Server)
+
+        $entries.Count | Should -Be 1
+        $entries[0].Name | Should -BeExactly 'räksmörgås.contoso.local'
+        $entries[0].Data | Should -Be '10.0.16.61'
+        $entries[0].Source | Should -Be 'Snapshot'
+    }
+
     It 'never exports for a live lookup when only a meta.json without zone files exists' {
         New-EntrySnapshot
         InModuleScope DnsTools -Parameters @{ Server = $script:Server } {

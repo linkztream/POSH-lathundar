@@ -28,7 +28,14 @@
       fabrikam.com (secondary): ro A 192.0.2.10
 
     A CNAME whose new target would loop is www pointed at itself; the stub raises
-    WIN32 9707 for it, as the server does.
+    WIN32 9707 for it (the measured Windows Server 2025 accepted it, CONTRACTS.md
+    13.9; the stub keeps the code to test the error path).
+
+    The stubs model the measured server: a TTL change goes through WMI
+    (Invoke-CimMethod Modify) and leaves the PTR records alone; changing or
+    removing an A/AAAA record with the DnsServer cmdlets deletes the PTR that
+    points at its name while $script:DnsStub.DeletesPtrWithHost is set (the
+    default); every change makes the record static. CimUnavailable takes WMI away.
 #>
 
 BeforeAll {
@@ -38,7 +45,8 @@ BeforeAll {
     $script:ResultProperties = @('Action', 'Name', 'Type', 'Data', 'Result', 'Error', 'Zone', 'NodeName', 'Server', 'Id', 'BatchId', 'Timestamp')
     $script:LogKeys = @('Id', 'BatchId', 'Timestamp', 'Operator', 'Server', 'Action', 'Zone', 'NodeName', 'Name', 'Type', 'Data', 'Before', 'After', 'Result', 'Error')
     $script:DynamicText = 'Dynamic record, owned by the client or the DHCP server; re-register it instead, or pass -IncludeDynamic.'
-    $script:WriteCommands = @('Set-DnsServerResourceRecord', 'Remove-DnsServerResourceRecord', 'Add-DnsServerResourceRecordA', 'Add-DnsServerResourceRecordAAAA', 'Add-DnsServerResourceRecordCName', 'Add-DnsServerResourceRecordPtr')
+    $script:WriteCommands = @('Set-DnsServerResourceRecord', 'Remove-DnsServerResourceRecord', 'Add-DnsServerResourceRecordA', 'Add-DnsServerResourceRecordAAAA', 'Add-DnsServerResourceRecordCName', 'Add-DnsServerResourceRecordPtr', 'Invoke-CimMethod')
+    $script:ServerDeletedText = 'Removed by the DNS server together with the A record change.'
 
     InModuleScope DnsTools -Parameters @{ StubPath = $script:StubPath } {
         param ($StubPath)
@@ -174,6 +182,21 @@ BeforeAll {
         }
     }
 
+    function Set-StubServer {
+        <#
+        .SYNOPSIS
+            Takes WMI away (no CIM session) and chooses whether the modelled server
+            deletes the PTR together with an A/AAAA record.
+        #>
+        param ([bool]$CimUnavailable, [bool]$DeletesPtrWithHost)
+
+        InModuleScope DnsTools -Parameters @{ CimUnavailable = $CimUnavailable; DeletesPtrWithHost = $DeletesPtrWithHost } {
+            param ($CimUnavailable, $DeletesPtrWithHost)
+            $script:DnsStub.CimUnavailable = $CimUnavailable
+            $script:DnsStub.DeletesPtrWithHost = $DeletesPtrWithHost
+        }
+    }
+
     function Read-ChangeLog {
         <#
         .SYNOPSIS
@@ -298,7 +321,7 @@ Describe 'Set-DnsEntry' {
     }
 
     Context '-TTL' {
-        It 'sets the TTL of the A record and of every PTR that points at the name, shadowed /16 included, in place' {
+        It 'sets the TTL of the A record and of every PTR that points at the name, shadowed /16 included, in place through WMI; the PTR records stay' {
             $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -TTL 300 -Server $script:Server -LogPath $script:LogPath)
 
             Get-Outcome $results | Should -Be @(
@@ -313,9 +336,15 @@ Describe 'Set-DnsEntry' {
             (Get-StubRecord -Zone 'contoso.local' -Node 'srv01' -Type 'A').Ttl | Should -Be 300
             (Get-StubRecord -Zone '16.0.10.in-addr.arpa' -Node '20' -Type 'PTR').Ttl | Should -Be 300
             (Get-StubRecord -Zone '0.10.in-addr.arpa' -Node '20.16' -Type 'PTR').Ttl | Should -Be 300
-            Get-StubCallCount -Command 'Set-DnsServerResourceRecord' | Should -Be 3
+            # WMI Modify for all three; the DnsServer cmdlet would have deleted the PTRs.
+            Get-StubCallCount -Command 'Invoke-CimMethod' | Should -Be 3
+            Get-StubCallCount -Command 'Set-DnsServerResourceRecord' | Should -Be 0
             Get-StubCallCount -Command 'Remove-DnsServerResourceRecord' | Should -Be 0
             Get-StubCallCount -Command 'Add-DnsServerResourceRecordA' | Should -Be 0
+            Get-StubCallCount -Command 'Add-DnsServerResourceRecordPtr' | Should -Be 0
+            InModuleScope DnsTools { @($script:DnsStub.ImplicitPtrDeletes).Count } | Should -Be 0
+            # One CIM session for the batch.
+            Get-StubCallCount -Command 'New-CimSession' | Should -Be 1
 
             $lines = @(Read-ChangeLog -Path $script:LogPath)
             $lines[0].Before.Ttl | Should -Be 3600
@@ -377,6 +406,89 @@ Describe 'Set-DnsEntry' {
             (Get-StubRecord -Zone 'contoso.local' -Node 'web' -Type 'A').Ttl | Should -Be 3600
         }
 
+        It 'without WMI changes the TTL with Set-DnsServerResourceRecord and re-creates the PTR records the server deleted, with one warning per run' {
+            Set-StubServer -CimUnavailable $true -DeletesPtrWithHost $true
+
+            $results = @('srv01.contoso.local', 'web.contoso.local' | Set-DnsEntry -TTL 300 -Server $script:Server -LogPath $script:LogPath -WarningVariable warnings -WarningAction SilentlyContinue)
+
+            Get-Outcome $results | Should -Be @(
+                'SetTtl A srv01.contoso.local Success'
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'AddPtr PTR 20.16.0.10.in-addr.arpa Success'
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'AddPtr PTR 20.16.0.10.in-addr.arpa Success'
+                'SetTtl A web.contoso.local Success'
+                'RemovePtr PTR 40.16.0.10.in-addr.arpa Success'
+                'AddPtr PTR 40.16.0.10.in-addr.arpa Success'
+            )
+            @($results[1..2] | ForEach-Object { $_.Zone }) | Should -Be @('16.0.10.in-addr.arpa', '16.0.10.in-addr.arpa')
+            @($results[3..4] | ForEach-Object { $_.Zone }) | Should -Be @('0.10.in-addr.arpa', '0.10.in-addr.arpa')
+            foreach ($result in @($results | Where-Object { $_.Action -eq 'RemovePtr' })) {
+                $result.Error | Should -BeExactly $script:ServerDeletedText
+            }
+            @($results | Where-Object { $_.Action -eq 'AddPtr' } | ForEach-Object { $_.Data }) | Should -Be @('srv01.contoso.local', 'srv01.contoso.local', 'web.contoso.local')
+            @($warnings | Where-Object { "$_" -eq "root\MicrosoftDNS on '$($script:Server)' is not available; TTL changes of A/AAAA records re-create their PTR records." }).Count | Should -Be 1
+            @($warnings).Count | Should -Be 1
+
+            (Get-StubRecord -Zone '16.0.10.in-addr.arpa' -Node '20' -Type 'PTR').Ttl | Should -Be 300
+            (Get-StubRecord -Zone '0.10.in-addr.arpa' -Node '20.16' -Type 'PTR').Ttl | Should -Be 300
+            (Get-StubRecord -Zone '16.0.10.in-addr.arpa' -Node '40' -Type 'PTR').Ttl | Should -Be 300
+            (Get-StubRecord -Zone 'contoso.local' -Node 'srv01' -Type 'A').Ttl | Should -Be 300
+            Get-StubCallCount -Command 'Set-DnsServerResourceRecord' | Should -Be 2
+            Get-StubCallCount -Command 'Invoke-CimMethod' | Should -Be 0
+            @(Get-StubCallLog -Command 'Add-DnsServerResourceRecordPtr' | ForEach-Object { $_['TimeToLive'] }) | Should -Be @((New-TimeSpan -Seconds 300), (New-TimeSpan -Seconds 300), (New-TimeSpan -Seconds 300))
+
+            # The log keeps the PTR as it was before the server deleted it.
+            $removeLine = @(Read-ChangeLog -Path $script:LogPath | Where-Object { $_.Action -eq 'RemovePtr' })[0]
+            $removeLine.Result | Should -Be 'Success'
+            $removeLine.Error | Should -BeExactly $script:ServerDeletedText
+            $removeLine.Before.Data | Should -Be 'srv01.contoso.local'
+            $removeLine.Before.Ttl | Should -Be 3600
+        }
+
+        It 'without WMI keeps the PTR records on a server that does not delete them and sets their TTL with the cmdlet' {
+            Set-StubServer -CimUnavailable $true -DeletesPtrWithHost $false
+
+            $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -TTL 300 -Server $script:Server -LogPath $script:LogPath -WarningVariable warnings -WarningAction SilentlyContinue)
+
+            Get-Outcome $results | Should -Be @(
+                'SetTtl A srv01.contoso.local Success'
+                'SetTtl PTR 20.16.0.10.in-addr.arpa Success'
+                'SetTtl PTR 20.16.0.10.in-addr.arpa Success'
+            )
+            @($warnings).Count | Should -Be 0
+            (Get-StubRecord -Zone '16.0.10.in-addr.arpa' -Node '20' -Type 'PTR').Ttl | Should -Be 300
+            (Get-StubRecord -Zone '0.10.in-addr.arpa' -Node '20.16' -Type 'PTR').Ttl | Should -Be 300
+            Get-StubCallCount -Command 'Set-DnsServerResourceRecord' | Should -Be 3
+            Get-StubCallCount -Command 'Add-DnsServerResourceRecordPtr' | Should -Be 0
+            Get-StubCallCount -Command 'Remove-DnsServerResourceRecord' | Should -Be 0
+        }
+
+        It 'without WMI changes the TTL of an alias with the cmdlet and gives no warning' {
+            Set-StubServer -CimUnavailable $true -DeletesPtrWithHost $true
+
+            $results = @(Set-DnsEntry -Identity 'www.contoso.local' -TTL 60 -Server $script:Server -LogPath $script:LogPath -WarningVariable warnings -WarningAction SilentlyContinue)
+
+            Get-Outcome $results | Should -Be @('SetTtl CNAME www.contoso.local Success')
+            (Get-StubRecord -Zone 'contoso.local' -Node 'www' -Type 'CNAME').Ttl | Should -Be 60
+            @($warnings).Count | Should -Be 0
+        }
+
+        It 'falls back to the cmdlet when the WMI provider refuses the change' {
+            Set-StubFailure -Command 'Invoke-CimMethod' -Code 5
+
+            $results = @(Set-DnsEntry -Identity 'web.contoso.local' -TTL 120 -Server $script:Server -LogPath $script:LogPath -WarningAction SilentlyContinue)
+
+            Get-Outcome $results | Should -Be @(
+                'SetTtl A web.contoso.local Success'
+                'RemovePtr PTR 40.16.0.10.in-addr.arpa Success'
+                'AddPtr PTR 40.16.0.10.in-addr.arpa Success'
+            )
+            # Once refused, the rest of the run uses the cmdlet directly.
+            Get-StubCallCount -Command 'Invoke-CimMethod' | Should -Be 1
+            (Get-StubRecord -Zone '16.0.10.in-addr.arpa' -Node '40' -Type 'PTR').Ttl | Should -Be 120
+        }
+
         It 'fails with NotFound for <Identity>' -TestCases @(
             @{ Identity = 'nothere.contoso.local' }
             @{ Identity = '10.0.16.10' }
@@ -396,17 +508,34 @@ Describe 'Set-DnsEntry' {
     }
 
     Context '-Address' {
-        It 'moves the A record in place, removes the old PTR records that point at the name and adds the new one' {
+        It 'removes the old PTR records that point at the name first, then moves the A record in place and adds the new PTR (DeletesPtrWithHost <Deletes>)' -TestCases @(
+            @{ Deletes = $true }
+            @{ Deletes = $false }
+        ) {
+            Set-StubServer -CimUnavailable $false -DeletesPtrWithHost $Deletes
+
             $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -Address '10.0.16.61' -Server $script:Server -LogPath $script:LogPath -Force)
 
             Get-Outcome $results | Should -Be @(
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
                 'SetAddress A srv01.contoso.local Success'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
                 'AddPtr PTR 61.16.0.10.in-addr.arpa Success'
             )
-            $results[0].Data | Should -Be '10.0.16.61'
+            $results[2].Data | Should -Be '10.0.16.61'
             $results[3].Data | Should -Be 'srv01.contoso.local'
+            # The explicit removals came first, so the server had nothing left to delete.
+            InModuleScope DnsTools { @($script:DnsStub.ImplicitPtrDeletes).Count } | Should -Be 0
+
+            # The old PTR records are logged with what they were.
+            $removeLines = @(Read-ChangeLog -Path $script:LogPath | Where-Object { $_.Action -eq 'RemovePtr' })
+            $removeLines.Count | Should -Be 2
+            foreach ($line in $removeLines) {
+                $line.Result | Should -Be 'Success'
+                $line.Error | Should -BeNullOrEmpty
+                $line.Before.Data | Should -Be 'srv01.contoso.local'
+                $line.Before.Ttl | Should -Be 3600
+            }
 
             @(Get-StubRecord -Zone 'contoso.local' -Node 'srv01' -Type 'A').Data | Should -Be @('10.0.16.61')
             @(Get-StubRecord -Zone '16.0.10.in-addr.arpa' -Node '20' -Type 'PTR').Count | Should -Be 0
@@ -427,9 +556,9 @@ Describe 'Set-DnsEntry' {
             $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -Address '10.0.16.61' -TTL 600 -Server $script:Server -LogPath $script:LogPath -Force)
 
             Get-Outcome $results | Should -Be @(
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
                 'SetAddress A srv01.contoso.local Success'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
                 'AddPtr PTR 61.16.0.10.in-addr.arpa Success'
                 'SetTtl A srv01.contoso.local Success'
             )
@@ -437,6 +566,26 @@ Describe 'Set-DnsEntry' {
             $record.Data | Should -Be '10.0.16.61'
             $record.Ttl | Should -Be 600
             (Get-StubRecord -Zone '16.0.10.in-addr.arpa' -Node '61' -Type 'PTR').Ttl | Should -Be 600
+        }
+
+        It 'with -TTL and without WMI re-creates the new PTR that the server deleted with the TTL change' {
+            Set-StubServer -CimUnavailable $true -DeletesPtrWithHost $true
+
+            $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -Address '10.0.16.61' -TTL 600 -Server $script:Server -LogPath $script:LogPath -Force -WarningAction SilentlyContinue)
+
+            Get-Outcome $results | Should -Be @(
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'SetAddress A srv01.contoso.local Success'
+                'AddPtr PTR 61.16.0.10.in-addr.arpa Success'
+                'SetTtl A srv01.contoso.local Success'
+                'RemovePtr PTR 61.16.0.10.in-addr.arpa Success'
+                'AddPtr PTR 61.16.0.10.in-addr.arpa Success'
+            )
+            $results[5].Error | Should -BeExactly $script:ServerDeletedText
+            $ptr = Get-StubRecord -Zone '16.0.10.in-addr.arpa' -Node '61' -Type 'PTR'
+            $ptr.Data | Should -Be 'srv01.contoso.local'
+            $ptr.Ttl | Should -Be 600
         }
 
         It 'fails with Ambiguous for a name with two A records and points at Get-DnsEntry' {
@@ -469,9 +618,9 @@ Describe 'Set-DnsEntry' {
             $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -Address '10.0.16.50' -Server $script:Server -LogPath $script:LogPath -Force)
 
             Get-Outcome $results | Should -Be @(
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
                 'SetAddress A srv01.contoso.local Success'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
                 'AddPtr PTR 50.16.0.10.in-addr.arpa Skipped'
             )
             $results[3].Error | Should -BeLike '*taken.contoso.local*-ReplacePtr*'
@@ -482,9 +631,9 @@ Describe 'Set-DnsEntry' {
             $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -Address '10.0.16.50' -ReplacePtr -Server $script:Server -LogPath $script:LogPath -Force)
 
             Get-Outcome $results | Should -Be @(
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
                 'SetAddress A srv01.contoso.local Success'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
                 'RemovePtr PTR 50.16.0.10.in-addr.arpa Success'
                 'AddPtr PTR 50.16.0.10.in-addr.arpa Success'
             )
@@ -496,8 +645,8 @@ Describe 'Set-DnsEntry' {
             $results = @(Set-DnsEntry -Identity 'web.contoso.local' -Address '192.168.5.5' -Server $script:Server -LogPath $script:LogPath -Force -WarningVariable warnings -WarningAction SilentlyContinue)
 
             Get-Outcome $results | Should -Be @(
-                'SetAddress A web.contoso.local Success'
                 'RemovePtr PTR 40.16.0.10.in-addr.arpa Success'
+                'SetAddress A web.contoso.local Success'
                 'AddPtr PTR 5.5.168.192.in-addr.arpa Skipped'
             )
             $results[2].Error | Should -BeLike 'No reverse zone for 192.168.5.5*'
@@ -692,7 +841,7 @@ Describe 'Set-DnsEntry' {
             Get-WriteCallCount | Should -Be 0
         }
 
-        It 'changes dynamic records with -IncludeDynamic, warns per record and logs After.Timestamp' {
+        It 'changes dynamic records with -IncludeDynamic, warns per record and logs that they became static' {
             $results = @(Set-DnsEntry -Identity 'dyn01.contoso.local' -TTL 60 -IncludeDynamic -Server $script:Server -LogPath $script:LogPath -WarningVariable warnings -WarningAction SilentlyContinue)
 
             Get-Outcome $results | Should -Be @(
@@ -704,8 +853,10 @@ Describe 'Set-DnsEntry' {
             $lines.Count | Should -Be 2
             foreach ($line in $lines) {
                 $line.Before.Timestamp | Should -Not -BeNullOrEmpty
+                $line.Before.IsStatic | Should -BeFalse
                 $line.After.PSObject.Properties.Name | Should -Contain 'Timestamp'
-                $line.After.Timestamp | Should -Not -BeNullOrEmpty
+                $line.After.Timestamp | Should -BeNullOrEmpty
+                $line.After.IsStatic | Should -BeTrue
                 $line.After.Ttl | Should -Be 60
             }
         }
@@ -714,13 +865,32 @@ Describe 'Set-DnsEntry' {
             $results = @(Set-DnsEntry -Identity 'dyn01.contoso.local' -Address '10.0.16.31' -Server $script:Server -LogPath $script:LogPath -Force)
 
             Get-Outcome $results | Should -Be @(
-                'SetAddress A dyn01.contoso.local Skipped'
                 'RemovePtr PTR 30.16.0.10.in-addr.arpa Skipped'
+                'SetAddress A dyn01.contoso.local Skipped'
                 'AddPtr PTR 31.16.0.10.in-addr.arpa Skipped'
             )
             $results[0].Error | Should -BeExactly $script:DynamicText
+            $results[1].Error | Should -BeExactly $script:DynamicText
             $results[2].Error | Should -BeLike 'Not done because SetAddress*'
             Get-WriteCallCount | Should -Be 0
+        }
+
+        It 'keeps a static A record at its address when its old PTR is dynamic, because the server would delete that PTR' {
+            InModuleScope DnsTools { Add-DnsStubRecord -ZoneName '0.10.in-addr.arpa' -Name '40.16' -RRType PTR -Data 'web.contoso.local' -AgeHours 3636304 }
+
+            $results = @(Set-DnsEntry -Identity 'web.contoso.local' -Address '10.0.16.41' -Server $script:Server -LogPath $script:LogPath -Force)
+
+            Get-Outcome $results | Should -Be @(
+                'RemovePtr PTR 40.16.0.10.in-addr.arpa Skipped'
+                'RemovePtr PTR 40.16.0.10.in-addr.arpa Skipped'
+                'SetAddress A web.contoso.local Skipped'
+                'AddPtr PTR 41.16.0.10.in-addr.arpa Skipped'
+            )
+            $results[0].Error | Should -Be "Not done because SetAddress of 'web.contoso.local' was skipped."
+            $results[1].Error | Should -BeExactly $script:DynamicText
+            $results[2].Error | Should -Be "Not done because RemovePtr of '40.16.0.10.in-addr.arpa' was skipped."
+            Get-WriteCallCount | Should -Be 0
+            (Get-StubRecord -Zone 'contoso.local' -Node 'web' -Type 'A').Data | Should -Be '10.0.16.40'
         }
     }
 
@@ -764,8 +934,8 @@ Describe 'Set-DnsEntry' {
             Should -Invoke Read-Host -ModuleName DnsTools -Times 0 -Exactly
 
             $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -Address '10.0.16.61' -Server $script:Server -LogPath $script:LogPath)
-            Should -Invoke Read-Host -ModuleName DnsTools -Times 1 -Exactly -ParameterFilter { $Prompt -like "Change DNS records`n  srv01.contoso.local: change A srv01.contoso.local from 10.0.16.20 to 10.0.16.61;*" }
-            $results[0].Result | Should -Be 'Success'
+            Should -Invoke Read-Host -ModuleName DnsTools -Times 1 -Exactly -ParameterFilter { $Prompt -like "Change DNS records`n  srv01.contoso.local: remove PTR 20.16.0.10.in-addr.arpa -> srv01.contoso.local; remove PTR 20.16.0.10.in-addr.arpa -> srv01.contoso.local; change A srv01.contoso.local from 10.0.16.20 to 10.0.16.61;*" }
+            @($results | ForEach-Object { $_.Result }) | Should -Be @('Success', 'Success', 'Success', 'Success')
         }
 
         It 'answer N skips every sub-operation of the item' {
@@ -845,20 +1015,24 @@ Describe 'Set-DnsEntry' {
         }
 
         It 'writes the Failed Result and ends the batch with ServerUnreachable when the server cannot be reached' {
-            Set-StubFailure -Command 'Set-DnsServerResourceRecord' -Code 1722
+            Set-StubFailure -Command 'Invoke-CimMethod' -Code 1722
 
             $run = Invoke-Collected { 'web.contoso.local', 'srv01.contoso.local' | Set-DnsEntry -TTL 120 -Server $script:Server -LogPath $script:LogPath -Force }
 
             $run['Error'] | Should -Not -BeNullOrEmpty
             $run['Error'].FullyQualifiedErrorId | Should -BeLike 'DnsTools.Set-DnsEntry.ServerUnreachable,*'
             Get-Outcome $run['Results'] | Should -Be @('SetTtl A web.contoso.local Failed')
-            Get-StubCallCount -Command 'Set-DnsServerResourceRecord' | Should -Be 1
+            # An unreachable server is not a reason to try the DnsServer cmdlet.
+            Get-StubCallCount -Command 'Invoke-CimMethod' | Should -Be 1
+            Get-StubCallCount -Command 'Set-DnsServerResourceRecord' | Should -Be 0
             $lines = @(Read-ChangeLog -Path $script:LogPath)
             $lines.Count | Should -Be 1
             $lines[0].Result | Should -Be 'Failed'
         }
 
         It 'reports a refused write as a per-item failure and goes on with the next item' {
+            # Refused over WMI and then by the DnsServer cmdlet it falls back to.
+            Set-StubFailure -Command 'Invoke-CimMethod' -Code 5
             Set-StubFailure -Command 'Set-DnsServerResourceRecord' -Code 5
 
             $results = @('web.contoso.local', 'www.contoso.local' | Set-DnsEntry -TTL 120 -Server $script:Server -LogPath $script:LogPath -ErrorVariable errors -ErrorAction SilentlyContinue)
@@ -875,20 +1049,36 @@ Describe 'Set-DnsEntry' {
             }
         }
 
-        It 'skips the PTR sync when the address change itself fails' {
+        It 'skips the new PTR when the address change fails after the old PTR records were removed' {
             Set-StubFailure -Command 'Set-DnsServerResourceRecord' -Code 5
 
             $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -Address '10.0.16.61' -Server $script:Server -LogPath $script:LogPath -Force -ErrorAction SilentlyContinue)
 
             Get-Outcome $results | Should -Be @(
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
                 'SetAddress A srv01.contoso.local Failed'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Skipped'
-                'RemovePtr PTR 20.16.0.10.in-addr.arpa Skipped'
                 'AddPtr PTR 61.16.0.10.in-addr.arpa Skipped'
             )
             $results[3].Error | Should -Be "Not done because SetAddress of 'srv01.contoso.local' ended as Failed."
-            Get-StubCallCount -Command 'Remove-DnsServerResourceRecord' | Should -Be 0
+            Get-StubCallCount -Command 'Remove-DnsServerResourceRecord' | Should -Be 2
             Get-StubCallCount -Command 'Add-DnsServerResourceRecordPtr' | Should -Be 0
+        }
+
+        It 'does not change the address when an old PTR record cannot be removed' {
+            InModuleScope DnsTools { $script:DnsStub.Fail['Remove-DnsServerResourceRecord'] = @('0.10.in-addr.arpa') }
+
+            $results = @(Set-DnsEntry -Identity 'srv01.contoso.local' -Address '10.0.16.61' -Server $script:Server -LogPath $script:LogPath -Force -ErrorAction SilentlyContinue)
+
+            Get-Outcome $results | Should -Be @(
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Success'
+                'RemovePtr PTR 20.16.0.10.in-addr.arpa Failed'
+                'SetAddress A srv01.contoso.local Skipped'
+                'AddPtr PTR 61.16.0.10.in-addr.arpa Skipped'
+            )
+            $results[2].Error | Should -Be "Not done because RemovePtr of '20.16.0.10.in-addr.arpa' ended as Failed."
+            Get-StubCallCount -Command 'Set-DnsServerResourceRecord' | Should -Be 0
+            (Get-StubRecord -Zone 'contoso.local' -Node 'srv01' -Type 'A').Data | Should -Be '10.0.16.20'
         }
 
         It 'reports a failed read as Failed and goes on with the next item' {
@@ -927,6 +1117,7 @@ Describe 'Set-DnsEntry' {
         }
 
         It 'reports WIN32 9712 (zone not writable) from the server as Skipped' {
+            Set-StubFailure -Command 'Invoke-CimMethod' -Code 9712
             Set-StubFailure -Command 'Set-DnsServerResourceRecord' -Code 9712
 
             $results = @(Set-DnsEntry -Identity 'www.contoso.local' -TTL 120 -Server $script:Server -LogPath $script:LogPath -ErrorVariable errors -ErrorAction SilentlyContinue)
@@ -1033,8 +1224,9 @@ Describe 'Set-DnsEntry' {
 
             $results = @($copy | Set-DnsEntry -Address '10.0.16.61' -Server $script:Server -LogPath $script:LogPath -Force)
 
-            $results[0].Action | Should -Be 'SetAddress'
-            $results[0].Result | Should -Be 'Success'
+            $addressResult = @($results | Where-Object { $_.Action -eq 'SetAddress' })
+            $addressResult.Count | Should -Be 1
+            $addressResult[0].Result | Should -Be 'Success'
             (Get-StubRecord -Zone 'contoso.local' -Node 'srv01' -Type 'A').Data | Should -Be '10.0.16.61'
         }
 
